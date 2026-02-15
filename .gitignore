@@ -1,6 +1,16 @@
 node_modules/
+
+# Env and credentials (root or in config/) — never commit
 .env
+config/
+config/.env
 *-credentials.json
 *-key.json
 credentials.json
 token.json
+
+# Screenshots from job search runs
+screenshots/
+
+# Generated documents (cover letters, resumes)
+document-creation/documents/
