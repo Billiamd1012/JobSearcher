@@ -51,43 +51,65 @@
  * Output: One JSON file per job in ./job-data/
  */
 
+require('dotenv').config();
 const { chromium } = require('playwright');
 
 async function main() {
-  // --- 1. SETUP ---
-  const browser = await chromium.launch({
-    headless: false, // set to false for debugging
-  });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  });
-  const page = await context.newPage();
+  let browser;
+  try {
+    // --- 1. SETUP ---
+    browser = await chromium.launch({
+      headless: false, // set to false for debugging
+    });
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    });
+    const page = await context.newPage();
 
-  // --- 2. NAVIGATE TO SEEK ---
-  const SEEK_URL = 'https://www.seek.com.au/';
-  await page.goto(SEEK_URL, { waitUntil: 'domcontentloaded' });
-  await page.waitForLoadState('networkidle');
-  await page
-    .getByRole('heading', { name: /perform a job search/i })
-    .waitFor({ state: 'visible', timeout: 15000 });
+    // --- 2. NAVIGATE TO SEEK ---
+    const SEEK_URL = 'https://www.seek.com.au/';
+    await page.goto(SEEK_URL, { waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle');
+    await page
+      .getByRole('heading', { name: /perform a job search/i })
+      .waitFor({ state: 'visible', timeout: 15000 });
 
-  // Dismiss login popup: click "Continue with Email" when it appears
-  const continueWithEmail = page.getByRole('link', {
-    name: /continue with email/i,
-  });
-  await continueWithEmail.waitFor({ state: 'visible', timeout: 8000 });
-  await continueWithEmail.click();
+    // Dismiss login popup: wait for "Continue with Email", or click Sign in to open it
+    const continueWithEmail = page.getByRole('link', {
+      name: /continue with email/i,
+    });
+    try {
+      await continueWithEmail.waitFor({ state: 'visible', timeout: 8000 });
+      await continueWithEmail.click();
+    } catch {
+      const signInButton = page.getByRole('link', { name: /sign in/i });
+      await signInButton.waitFor({ state: 'visible', timeout: 5000 });
+      await signInButton.click();
+      await continueWithEmail.waitFor({ state: 'visible', timeout: 8000 });
+      await continueWithEmail.click();
+    }
 
-  // TODO: 3. Apply search criteria
-  // TODO: 4. Collect job listings (with pagination)
+    // Fill email on login page
+    const emailField = page.getByLabel(/email address/i);
+    await emailField.waitFor({ state: 'visible', timeout: 10000 });
+    await emailField.fill(process.env.LOGIN_EMAIL || '');
 
-  // Show browser for 10 seconds before closing
-  await new Promise((resolve) => setTimeout(resolve, 10000));
+    const emailSignInCodeButton = page.getByRole('button', {
+      name: /email me a sign in code/i,
+    });
+    await emailSignInCodeButton.waitFor({ state: 'visible', timeout: 5000 });
+    await emailSignInCodeButton.click();
 
-  // --- 5. CLEANUP ---
-  await browser.close();
+    // TODO: 3. Apply search criteria
+    // TODO: 4. Collect job listings (with pagination)
+
+    // Show browser for 10 seconds before closing
+    await new Promise((resolve) => setTimeout(resolve, 20000));
+  } finally {
+    if (browser) await browser.close();
+  }
 }
 
 main().catch((err) => {
