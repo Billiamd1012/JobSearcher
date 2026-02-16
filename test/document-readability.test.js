@@ -20,7 +20,7 @@ const {
   DEFAULT_RESUME_DIR,
   DEFAULT_COVERLETTER_DIR,
   SUPPORTED_DOC_EXTENSIONS,
-} = require('../document-creation/cover-letter-generator.js');
+} = require('../document-creation/cover-letter-generator/index.js');
 
 const MIN_LENGTH = 15;
 const MIN_WORDS = 2;

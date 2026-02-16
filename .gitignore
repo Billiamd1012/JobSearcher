@@ -4,6 +4,7 @@ node_modules/
 .env
 config/
 config/.env
+!config/.env.example
 *-credentials.json
 *-key.json
 credentials.json
@@ -12,5 +13,9 @@ token.json
 # Screenshots from job search runs
 screenshots/
 
-# Generated documents (cover letters, resumes)
-document-creation/documents/
+# Generated documents (cover letters, resumes); applicant-details folder contents are private
+document-creation/documents/*
+# Un-ignore details/ so negation of template file can take effect; keep applicant-details/ ignored
+!document-creation/documents/details/
+!document-creation/documents/details/applicant-details-template.md
+document-creation/documents/details/applicant-details/

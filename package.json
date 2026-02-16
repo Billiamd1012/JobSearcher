@@ -5,16 +5,18 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.js",
-    "cover-letter": "node document-creation/cover-letter-generator.js"
+    "cover-letter": "node document-creation/cover-letter-generator/index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "docx": "^9.5.2",
     "dotenv": "^17.3.1",
     "googleapis": "^171.4.0",
     "mammoth": "^1.11.0",
+    "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.4",
     "playwright": "^1.58.2"
   }

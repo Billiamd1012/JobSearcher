@@ -12,7 +12,8 @@ require('dotenv').config({ path: path.join(__dirname, 'config', '.env') });
 const { google } = require('googleapis');
 
 const TOKEN_PATH = path.join(__dirname, 'config', 'token.json');
-const JOBS_SHEET_ID = '1pHP6WloSO0j7AddRdOd5Urunf-ZUcKS3Gas3O916mbg';
+/** Jobs spreadsheet ID (set JOBS_SHEET_ID in config/.env). Used as default when no spreadsheetId is passed. */
+const JOBS_SHEET_ID = process.env.JOBS_SHEET_ID || '';
 
 /**
  * Build a row array for the Jobs sheet from a job object. Validates input.
@@ -87,8 +88,7 @@ class SheetsManager {
 
   /**
    * Check that the Jobs sheet is accessible (retrieve its metadata or first range).
-   * Sheet ID: 1pHP6WloSO0j7AddRdOd5Urunf-ZUcKS3Gas3O916mbg
-   * @param {string} [spreadsheetId] - Defaults to the Jobs sheet ID.
+   * @param {string} [spreadsheetId] - Defaults to JOBS_SHEET_ID from config/.env.
    * @returns {Promise<{ title: string, sheetId: number, rowCount?: number, colCount?: number }>} - Basic sheet info if accessible.
    */
   async retrieveJobsSheet(spreadsheetId = JOBS_SHEET_ID) {
@@ -107,6 +107,50 @@ class SheetsManager {
       rowCount: grid.rowCount,
       colCount: grid.columnCount,
     };
+  }
+
+  /**
+   * Get values from a range. Row 0 is the first row (may be headers).
+   * @param {string} range - e.g. 'Sheet1!A:J'
+   * @param {string} [spreadsheetId]
+   * @returns {Promise<string[][]>} Rows of cell values
+   */
+  async getValues(range, spreadsheetId = JOBS_SHEET_ID) {
+    const res = await this.sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    });
+    return (res.data.values || []).map((row) => [...row]);
+  }
+
+  /**
+   * Get job rows that are not marked as applied and have a Seek job ID in the link.
+   * Assumes columns A:I = Position, Company, Want, Posted, Expiry, Genre, Type, Location, Link;
+   * optional column J = Applied (truthy = applied). Skips rows with no /job/NNN/ in Link (pre-automation).
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   * @returns {Promise<Array<{ rowIndex: number, jobId: string, link: string, positionName: string, company: string }>>}
+   */
+  async getUnappliedJobs(spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    const rows = await this.getValues(`${sheetName}!A:J`, spreadsheetId);
+    const out = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const link = (row[8] && String(row[8]).trim()) || '';
+      const applied = (row[9] && String(row[9]).trim()) || '';
+      if (/^\s*y(es)?|1|true\s*$/i.test(applied)) continue;
+      const idMatch = link.match(/\/job\/(\d+)/);
+      if (!idMatch) continue;
+      const jobId = idMatch[1];
+      out.push({
+        rowIndex: i + 1,
+        jobId,
+        link: link.startsWith('http') ? link : `https://www.seek.com.au${link.startsWith('/') ? link : '/' + link}`,
+        positionName: (row[0] && String(row[0]).trim()) || '',
+        company: (row[1] && String(row[1]).trim()) || '',
+      });
+    }
+    return out;
   }
 
   /**

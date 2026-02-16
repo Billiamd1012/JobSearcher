@@ -1,18 +1,22 @@
 /**
- * Cover Letter Generator — Steps 1 & 2
+ * Cover Letter Generator — Steps 1–7
  *
- * Step 1: Setup / entry point — accept job-data path(s), optional resume, output path;
- *         resolve paths, load job data, ensure output directory exists.
- * Step 2: Local LLM lifecycle — check if Ollama is running; if not, spawn it and wait for ready.
+ * Step 1: Setup / entry point. Step 2: Local LLM lifecycle (Ollama).
+ * Step 3: Prompt construction. Step 4: Call Ollama (with optional retry).
+ * Step 5: Post-process output; for each job create a folder with coverletter.txt, coverletter.docx, coverletter.pdf.
+ * Step 6: Cleanup — optionally stop Ollama if we started it (COVER_LETTER_STOP_OLLAMA=1).
+ * Step 7: Edge cases — multiple jobs, OLLAMA_MODEL, optional resume, retry/backoff.
  *
  * Usage:
- *   node document-creation/cover-letter-generator.js [jobDataPath] [--resume path] [--out path]
+ *   node document-creation/cover-letter-generator [jobDataPath] [--resume path] [--out path]
  *   jobDataPath: path to a single job JSON file or to job-data/ directory (default: job-data/)
  *   --resume path: optional path to resume text file
  *   --out path: output directory for cover letters (default: document-creation/documents/coverletter)
  *
  * Requires Ollama installed and (unless already running) available on PATH for spawning.
- * Set OLLAMA_MODEL to the model to use (default: llama3.2). Pull with e.g. ollama pull llama3.2.
+ * Env: OLLAMA_MODEL (default: llama3.2), OLLAMA_BASE_URL; COVER_LETTER_OUTPUT_FORMAT (txt|docx);
+ * APPLICANT_NAME or APPLICANT_LAST_NAME for output filename; COVER_LETTER_STOP_OLLAMA=1 to kill Ollama on exit;
+ * OLLAMA_RETRY_ATTEMPTS, OLLAMA_RETRY_DELAY_MS for step 7 retry/backoff.
  */
 
 const path = require('path');
@@ -21,12 +25,16 @@ const http = require('http');
 const { spawn } = require('child_process');
 const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
+const { Document, Paragraph, TextRun, Packer } = require('docx');
+const { PDFDocument, StandardFonts } = require('pdf-lib');
 
-const PROJECT_ROOT = path.resolve(__dirname, '..');
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+const DOCUMENTS_DIR = path.join(__dirname, '..', 'documents');
 const DEFAULT_JOB_DATA = path.join(PROJECT_ROOT, 'job-data');
-const DEFAULT_OUTPUT_DIR = path.join(__dirname, 'documents', 'coverletter');
-const DEFAULT_RESUME_DIR = path.join(__dirname, 'documents', 'resume');
-const DEFAULT_COVERLETTER_DIR = path.join(__dirname, 'documents', 'coverletter');
+const DEFAULT_OUTPUT_DIR = path.join(DOCUMENTS_DIR, 'coverletter');
+const DEFAULT_RESUME_DIR = path.join(DOCUMENTS_DIR, 'resume');
+const DEFAULT_COVERLETTER_DIR = path.join(DOCUMENTS_DIR, 'coverletter');
+const DEFAULT_APPLICANT_DETAILS_DIR = path.join(DOCUMENTS_DIR, 'details', 'applicant-details');
 const DEFAULT_PROMPT_PATH = path.join(__dirname, 'prompts', 'cover-letter-default.txt');
 const SUPPORTED_DOC_EXTENSIONS = ['.txt', '.docx', '.pdf'];
 const SAMPLE_COVER_LETTER_NAMES = [
@@ -44,6 +52,10 @@ const OLLAMA_GENERATE_TIMEOUT_MS = 120000;
 const OLLAMA_MAX_TOKENS = 1024;
 const OLLAMA_TEMPERATURE = 0.7;
 const OLLAMA_STOP = ['\n\n\n', '---']; // stop on triple newline or markdown divider
+const COVER_LETTER_OUTPUT_FORMAT = (process.env.COVER_LETTER_OUTPUT_FORMAT || 'docx').toLowerCase(); // 'txt' | 'docx'
+const OLLAMA_RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.OLLAMA_RETRY_ATTEMPTS || '2', 10));
+const OLLAMA_RETRY_DELAY_MS = Math.max(0, parseInt(process.env.OLLAMA_RETRY_DELAY_MS || '2000', 10));
+const COVERLETTER_BASENAME = 'coverletter'; // inside each job folder: coverletter.txt, coverletter.docx, coverletter.pdf
 
 let ollamaProcess = null;
 
@@ -166,7 +178,7 @@ async function loadResume(resumePath) {
  * @returns {Promise<string>}
  */
 async function findAndLoadResumeFromDirectory(dir) {
-  const resolved = resolvePath(dir);
+  const resolved = path.isAbsolute(dir) ? dir : path.resolve(PROJECT_ROOT, dir);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return '';
   const files = fs.readdirSync(resolved).filter((f) =>
     SUPPORTED_DOC_EXTENSIONS.includes(path.extname(f).toLowerCase())
@@ -181,7 +193,7 @@ async function findAndLoadResumeFromDirectory(dir) {
  * @returns {Promise<string>}
  */
 async function loadSampleCoverLetter() {
-  const resolved = resolvePath(DEFAULT_COVERLETTER_DIR);
+  const resolved = DEFAULT_COVERLETTER_DIR;
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return '';
   const files = fs.readdirSync(resolved);
   for (const name of SAMPLE_COVER_LETTER_NAMES) {
@@ -198,6 +210,30 @@ async function loadSampleCoverLetter() {
     return readTextFromFile(path.join(resolved, sampleAny));
   }
   return '';
+}
+
+/**
+ * Load applicant details from document-creation/documents/details/applicant-details/.
+ * Prefers applicant.json; otherwise uses the first .json file (alphabetically).
+ * @param {string} [dir] - Directory to read from (default: DEFAULT_APPLICANT_DETAILS_DIR)
+ * @returns {{ applicantName?: string, lastName?: string, dob?: string, [key: string]: unknown }}
+ */
+function loadApplicantDetails(dir = DEFAULT_APPLICANT_DETAILS_DIR) {
+  const resolved = path.isAbsolute(dir) ? dir : path.resolve(PROJECT_ROOT, dir);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return {};
+  const files = fs.readdirSync(resolved).filter((f) => f.endsWith('.json'));
+  if (files.length === 0) return {};
+  const preferred = files.find((f) => f === 'applicant.json');
+  const name = preferred || files.sort()[0];
+  const filePath = path.join(resolved, name);
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const data = JSON.parse(raw);
+    return typeof data === 'object' && data !== null ? data : {};
+  } catch (err) {
+    console.warn('Could not read applicant details from', filePath, err.message);
+    return {};
+  }
 }
 
 /**
@@ -328,8 +364,7 @@ async function ensureOllamaRunning(options = {}) {
  * @returns {string}
  */
 function buildPromptFromTemplate(job, context = {}) {
-  const templatePath = path.resolve(__dirname, 'prompts', 'cover-letter-default.txt');
-  let template = fs.readFileSync(templatePath, 'utf-8');
+  let template = fs.readFileSync(DEFAULT_PROMPT_PATH, 'utf-8');
 
   const description = (job.description || '').slice(0, 12000);
   const resumeSnippet = (context.resumeSnippet || '').slice(0, 3000);
@@ -352,7 +387,7 @@ function buildPromptFromTemplate(job, context = {}) {
   };
 
   for (const [key, value] of Object.entries(vars)) {
-    template = template.replace(new RegExp(`{{${key}}}`, 'g'), value);
+    template = template.replace(new RegExp(`{{${key}}}`, 'g'), () => value);
   }
 
   return template;
@@ -432,6 +467,192 @@ function callOllamaGenerate(prompt, opts = {}) {
   });
 }
 
+// ---------- Step 5: Post-process and save ----------
+
+/**
+ * Strip markdown/code fences and normalize whitespace so the cover letter is plain text.
+ * @param {string} raw - Raw model output
+ * @returns {string}
+ */
+function postProcessCoverLetterText(raw) {
+  if (typeof raw !== 'string') return '';
+  let text = raw.trim();
+  // Remove optional markdown code block wrapper
+  const codeFence = /^```\w*\n?([\s\S]*?)```\s*$/m;
+  const match = text.match(codeFence);
+  if (match) text = match[1].trim();
+  // Collapse 3+ newlines to 2
+  text = text.replace(/\n{3,}/g, '\n\n');
+  return text.trimEnd() + (text ? '\n' : '');
+}
+
+/**
+ * Generate output folder name for a job: YYMMDD.LastName.CL.CompanyName (no extension).
+ * @param {object} job - Job with company, positionName, etc.
+ * @param {{ applicantLastName?: string }} [opts]
+ * @returns {string} Folder name only (no path)
+ */
+function generateOutputFolderName(job, opts = {}) {
+  const now = new Date();
+  const yy = String(now.getFullYear()).slice(-2);
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const datePart = yy + mm + dd;
+  const lastName = (opts.applicantLastName || '').trim() || 'Applicant';
+  const companySlug = (job.company || 'Company').replace(/\s+/g, '').replace(/[^\w\-]/g, '') || 'Company';
+  return `${datePart}.${lastName}.CL.${companySlug}`;
+}
+
+/**
+ * Generate output filename: YYMMDD.LastName.CL.CompanyName(.txt|.docx). Company and name have no spaces.
+ * @param {object} job - Job with company, positionName, etc.
+ * @param {{ applicantLastName?: string, outputFormat?: string }} [opts]
+ * @returns {string} Basename only (no path)
+ */
+function generateOutputFilename(job, opts = {}) {
+  const format = (opts.outputFormat || COVER_LETTER_OUTPUT_FORMAT).toLowerCase();
+  const ext = format === 'docx' ? '.docx' : '.txt';
+  const base = generateOutputFolderName(job, opts);
+  return base + ext;
+}
+
+/**
+ * Write cover letter text to a file (.txt or .docx).
+ * @param {string} fullPath - Absolute path to output file (including extension)
+ * @param {string} text - Plain text content
+ * @param {{ format?: string }} [opts] - format: 'txt' | 'docx'
+ * @returns {Promise<void>}
+ */
+async function writeCoverLetter(fullPath, text, opts = {}) {
+  const format = (opts.format || COVER_LETTER_OUTPUT_FORMAT).toLowerCase();
+  if (format === 'docx') {
+    const lines = text.split(/\n/);
+    const paragraphs = lines.map((line) => new Paragraph({ children: [new TextRun(line || ' ')] }));
+    const doc = new Document({ sections: [{ children: paragraphs }] });
+    const buffer = await Packer.toBuffer(doc);
+    fs.writeFileSync(fullPath, buffer);
+  } else {
+    fs.writeFileSync(fullPath, text, 'utf-8');
+  }
+}
+
+/**
+ * Create a PDF buffer from plain text (one paragraph per line, simple layout).
+ * @param {string} text - Plain text content
+ * @returns {Promise<Buffer>}
+ */
+async function textToPdfBuffer(text) {
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontSize = 11;
+  const lineHeight = fontSize * 1.4;
+  const margin = 50;
+  const lines = (text || '').trim().split(/\n/);
+  let page = pdfDoc.addPage();
+  let { width, height } = page.getSize();
+  let y = height - margin;
+
+  for (const line of lines) {
+    if (y < margin) {
+      page = pdfDoc.addPage();
+      ({ width, height } = page.getSize());
+      y = height - margin;
+    }
+    page.drawText(line || ' ', {
+      x: margin,
+      y,
+      size: fontSize,
+      font,
+    });
+    y -= lineHeight;
+  }
+
+  const bytes = await pdfDoc.save();
+  return Buffer.from(bytes);
+}
+
+/**
+ * Write cover letter to a job folder in three formats: .txt, .docx, .pdf.
+ * Creates the folder if needed; writes coverletter.txt, coverletter.docx, coverletter.pdf.
+ * @param {string} folderPath - Absolute path to the job folder (e.g. outputDir/YYMMDD.LastName.CL.Company)
+ * @param {string} text - Plain text content
+ * @returns {Promise<{ txtPath: string, docxPath: string, pdfPath: string }>}
+ */
+async function writeCoverLetterToFolder(folderPath, text) {
+  fs.mkdirSync(folderPath, { recursive: true });
+  const base = path.join(folderPath, COVERLETTER_BASENAME);
+  const txtPath = base + '.txt';
+  const docxPath = base + '.docx';
+  const pdfPath = base + '.pdf';
+
+  fs.writeFileSync(txtPath, text, 'utf-8');
+
+  const lines = text.split(/\n/);
+  const paragraphs = lines.map((line) => new Paragraph({ children: [new TextRun(line || ' ')] }));
+  const doc = new Document({ sections: [{ children: paragraphs }] });
+  const docxBuffer = await Packer.toBuffer(doc);
+  fs.writeFileSync(docxPath, docxBuffer);
+
+  const pdfBuffer = await textToPdfBuffer(text);
+  fs.writeFileSync(pdfPath, pdfBuffer);
+
+  return { txtPath, docxPath, pdfPath };
+}
+
+/**
+ * Get applicant last name from APPLICANT_NAME or APPLICANT_LAST_NAME env.
+ * @returns {string}
+ */
+function getApplicantLastName() {
+  const last = process.env.APPLICANT_LAST_NAME;
+  if (last && typeof last === 'string') return last.trim();
+  const full = process.env.APPLICANT_NAME;
+  if (full && typeof full === 'string') {
+    const parts = full.trim().split(/\s+/);
+    return parts[parts.length - 1] || 'Applicant';
+  }
+  return 'Applicant';
+}
+
+// ---------- Step 6: Cleanup ----------
+
+/**
+ * If we started Ollama and COVER_LETTER_STOP_OLLAMA=1, kill the process.
+ */
+function cleanupOllamaIfStarted() {
+  if (ollamaProcess && process.env.COVER_LETTER_STOP_OLLAMA === '1') {
+    ollamaProcess.kill();
+    ollamaProcess = null;
+    console.log('Ollama process stopped (COVER_LETTER_STOP_OLLAMA=1).');
+  }
+}
+
+// ---------- Step 7: Retry / backoff ----------
+
+/**
+ * Call Ollama generate with retries and backoff on failure.
+ * @param {string} prompt
+ * @param {object} [opts] - Same as callOllamaGenerate, plus retries
+ * @returns {Promise<string>}
+ */
+async function callOllamaGenerateWithRetry(prompt, opts = {}) {
+  const maxAttempts = Math.max(1, (opts.retryAttempts ?? OLLAMA_RETRY_ATTEMPTS) + 1);
+  const delayMs = opts.retryDelayMs ?? OLLAMA_RETRY_DELAY_MS;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await callOllamaGenerate(prompt, opts);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        console.warn(`Ollama attempt ${attempt}/${maxAttempts} failed: ${err.message}. Retrying in ${delayMs}ms...`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ---------- Main ----------
 
 async function main() {
@@ -463,34 +684,51 @@ async function main() {
   console.log('LLM backend:', startedByUs ? 'Ollama (started by this script)' : 'Ollama (already running)');
   console.log('Model:', OLLAMA_MODEL);
 
-  // Step 3 & 4: Build prompt per job, call Ollama, collect response text
+  // Step 3–5: Build prompt, call Ollama (with retry), post-process, write folder per job (.txt, .docx, .pdf)
+  const applicantDetails = loadApplicantDetails();
+  const applicantName =
+    (applicantDetails.applicantName && String(applicantDetails.applicantName).trim()) ||
+    process.env.APPLICANT_NAME ||
+    '';
+  const applicantLastName =
+    (applicantDetails.lastName && String(applicantDetails.lastName).trim()) ||
+    (applicantName ? applicantName.trim().split(/\s+/).pop() : '') ||
+    getApplicantLastName();
   const context = {
-    applicantName: process.env.APPLICANT_NAME || '',
+    applicantName,
     resumeSnippet: resumeText,
     sampleCoverLetter,
   };
   const results = [];
 
-  for (const entry of jobDataEntries) {
-    for (const job of entry.jobs) {
-      const prompt = buildPromptFromTemplate(job, context);
-      console.log(`\nGenerating cover letter for: ${job.positionName} at ${job.company} (prompt ${prompt.length} chars)...`);
-      const responseText = await callOllamaGenerate(prompt);
-      results.push({ job, entryPath: entry.path, responseText });
-      console.log(`  Done. Response length: ${responseText.length} chars`);
+  try {
+    for (const entry of jobDataEntries) {
+      for (const job of entry.jobs) {
+        const prompt = buildPromptFromTemplate(job, context);
+        console.log(`\nGenerating cover letter for: ${job.positionName} at ${job.company} (prompt ${prompt.length} chars)...`);
+        const responseText = await callOllamaGenerateWithRetry(prompt);
+        const cleaned = postProcessCoverLetterText(responseText);
+        const folderName = generateOutputFolderName(job, { applicantLastName });
+        const jobFolderPath = path.join(resolvedOutputDir, folderName);
+        const { txtPath, docxPath, pdfPath } = await writeCoverLetterToFolder(jobFolderPath, cleaned);
+        results.push({
+          job,
+          entryPath: entry.path,
+          responseText: cleaned,
+          outputFolder: jobFolderPath,
+          txtPath,
+          docxPath,
+          pdfPath,
+        });
+        console.log(`  Folder: ${jobFolderPath}`);
+        console.log(`    ${path.basename(txtPath)}, ${path.basename(docxPath)}, ${path.basename(pdfPath)}`);
+      }
     }
-  }
 
-  console.log(`\nGenerated ${results.length} cover letter(s).`);
-  if (results.length > 0 && results[0].responseText) {
-    const preview = results[0].responseText.slice(0, 200).replace(/\n/g, ' ');
-    console.log('First letter preview:', preview + (results[0].responseText.length > 200 ? '...' : ''));
-  }
-
-  // Optional: tear down if we started Ollama (configurable via env)
-  if (ollamaProcess && process.env.COVER_LETTER_STOP_OLLAMA === '1') {
-    ollamaProcess.kill();
-    console.log('Ollama process stopped (COVER_LETTER_STOP_OLLAMA=1).');
+    console.log(`\nGenerated ${results.length} cover letter(s).`);
+    results.forEach((r) => console.log('  ', r.outputFolder));
+  } finally {
+    cleanupOllamaIfStarted();
   }
 }
 
@@ -508,7 +746,19 @@ module.exports = {
   loadSampleCoverLetter,
   buildPromptFromTemplate,
   callOllamaGenerate,
+  callOllamaGenerateWithRetry,
+  postProcessCoverLetterText,
+  generateOutputFolderName,
+  generateOutputFilename,
+  writeCoverLetter,
+  writeCoverLetterToFolder,
+  textToPdfBuffer,
+  getApplicantLastName,
+  loadApplicantDetails,
+  cleanupOllamaIfStarted,
   DEFAULT_RESUME_DIR,
   DEFAULT_COVERLETTER_DIR,
+  DEFAULT_APPLICANT_DETAILS_DIR,
   SUPPORTED_DOC_EXTENSIONS,
+  COVERLETTER_BASENAME,
 };

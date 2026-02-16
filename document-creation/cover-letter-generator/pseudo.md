@@ -27,7 +27,7 @@
 
 ## 3. PROMPT CONSTRUCTION
 
-- Load or build a cover-letter prompt template (e.g. from `document-creation/prompts/` or inline).
+- Load or build a cover-letter prompt template (e.g. from `document-creation/cover-letter-generator/prompts/` or inline).
 - Template placeholders: company name, role title, job description (full or summarised), applicant name/context, resume snippet.
 - Optionally truncate or summarise the job description to fit context window.
 - Build the final prompt string (system + user, or single user message, depending on LLM API).
@@ -46,10 +46,10 @@
 ## 5. POST-PROCESS AND SAVE
 
 - Strip any extra markdown or boilerplate from the model output if needed.
-- Ensure the cover letter is plain text
-- Generate output filename YYMMDD.LastName.CL.CompanyName (nowhitespace).docx
-- Write the cover letter to the output folder (e.g. `document-creation/documents/coverletter/<filename>.docx`).
-- Log success and path; return path or summary for caller.
+- Ensure the cover letter is plain text.
+- For each job, create a folder: YYMMDD.LastName.CL.CompanyName (no whitespace in company part).
+- Inside the folder write three files: coverletter.txt (plain text), coverletter.docx (formatted), coverletter.pdf (generated from text via pdf-lib).
+- Log success and folder path; return path or summary for caller.
 
 ---
 
