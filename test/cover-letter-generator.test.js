@@ -14,18 +14,26 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const { Document, Packer } = require('docx');
+
 const {
   buildPromptFromTemplate,
   callOllamaGenerate,
   callOllamaGenerateWithRetry,
   postProcessCoverLetterText,
+  runCoverLetterChecks,
   generateOutputFolderName,
   generateOutputFilename,
   writeCoverLetter,
   writeCoverLetterToFolder,
+  wrapLineForPdf,
   textToPdfBuffer,
   getApplicantLastName,
   cleanupOllamaIfStarted,
+  stripAiMessageFromCoverLetterText,
+  buildCoverLetterDocxParagraphs,
+  AI_COVER_LETTER_MESSAGE,
+  DEFAULT_OUTPUT_DIR,
   COVERLETTER_BASENAME,
 } = require('../document-creation/cover-letter-generator/index.js');
 
@@ -389,6 +397,47 @@ describe('postProcessCoverLetterText (step 5)', () => {
     const raw = 'Hello world';
     assert.strictEqual(postProcessCoverLetterText(raw), 'Hello world\n');
   });
+
+  it('replaces name placeholders with applicantName when provided', () => {
+    const raw = 'Yours sincerely,\n\n[Your full name]';
+    const withName = postProcessCoverLetterText(raw, { applicantName: 'William Darker' });
+    assert.ok(withName.includes('William Darker'), withName);
+    assert.ok(!withName.includes('[Your full name]'), withName);
+
+    const insertHere = postProcessCoverLetterText('Sign-off,\n\nInsert name here', { applicantName: 'Jane Doe' });
+    assert.ok(insertHere.includes('Jane Doe'), insertHere);
+    assert.ok(!insertHere.includes('Insert name here'), insertHere);
+  });
+
+  it('leaves placeholders unchanged when applicantName is empty', () => {
+    const raw = 'Yours sincerely,\n\n[Your full name]';
+    assert.strictEqual(postProcessCoverLetterText(raw), raw.trimEnd() + '\n');
+    assert.strictEqual(postProcessCoverLetterText(raw, {}), raw.trimEnd() + '\n');
+  });
+});
+
+describe('runCoverLetterChecks (step 5)', () => {
+  it('fails when [Your full name] or other placeholders are present', () => {
+    const r1 = runCoverLetterChecks('Yours sincerely,\n\n[Your full name]');
+    assert.strictEqual(r1.ok, false);
+    assert.ok(r1.errors.some((e) => /Your full name/i.test(e)), r1.errors);
+
+    const r2 = runCoverLetterChecks('Sign-off,\n\nInsert name here');
+    assert.strictEqual(r2.ok, false);
+    assert.ok(r2.errors.some((e) => /Insert name here/i.test(e)), r2.errors);
+  });
+
+  it('fails when cover letter is empty', () => {
+    const r = runCoverLetterChecks('   \n  ');
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some((e) => /empty/i.test(e)), r.errors);
+  });
+
+  it('passes when no placeholders and content present', () => {
+    const r = runCoverLetterChecks('Yours sincerely,\n\nWilliam Darker');
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.errors.length, 0);
+  });
 });
 
 describe('generateOutputFilename (step 5)', () => {
@@ -458,12 +507,41 @@ describe('writeCoverLetterToFolder (step 5)', () => {
     assert.ok(fs.existsSync(txtPath));
     assert.ok(fs.existsSync(docxPath));
     assert.ok(fs.existsSync(pdfPath));
-    assert.strictEqual(fs.readFileSync(txtPath, 'utf-8'), text);
+    assert.strictEqual(fs.readFileSync(txtPath, 'utf-8'), text + (text ? '\n' : ''));
     assert.ok(path.basename(txtPath).startsWith(COVERLETTER_BASENAME));
     assert.ok(path.basename(docxPath).startsWith(COVERLETTER_BASENAME));
     assert.ok(path.basename(pdfPath).startsWith(COVERLETTER_BASENAME));
     const pdfBuf = fs.readFileSync(pdfPath);
     assert.ok(Buffer.isBuffer(pdfBuf) && pdfBuf.length > 100);
+  });
+});
+
+describe('DOCX white-text AI message (testLetters)', () => {
+  const testLettersDir = path.join(DEFAULT_OUTPUT_DIR, 'testLetters');
+  const whiteTextDocxPath = path.join(testLettersDir, 'white-text-test.docx');
+
+  before(() => {
+    fs.mkdirSync(testLettersDir, { recursive: true });
+  });
+
+  it('creates a DOCX in coverletter/testLetters with white-text AI message', async () => {
+    const bodyText = 'Dear Hiring Manager,\n\nI am writing to apply.';
+    const paragraphs = buildCoverLetterDocxParagraphs(bodyText);
+    const doc = new Document({ sections: [{ children: paragraphs }] });
+    const buffer = await Packer.toBuffer(doc);
+    fs.writeFileSync(whiteTextDocxPath, buffer);
+
+    assert.ok(fs.existsSync(whiteTextDocxPath));
+    const stat = fs.statSync(whiteTextDocxPath);
+    assert.ok(stat.size > 100, 'DOCX file should have content');
+  });
+
+  it('stripAiMessageFromCoverLetterText removes HTML/markdown/plain AI message', () => {
+    const withHtml = `Yours sincerely,\n\n<font color="#ffffff">**${AI_COVER_LETTER_MESSAGE}**</font>`;
+    assert.ok(!stripAiMessageFromCoverLetterText(withHtml).includes(AI_COVER_LETTER_MESSAGE));
+
+    const withPlain = `Yours sincerely,\n\n${AI_COVER_LETTER_MESSAGE}`;
+    assert.ok(!stripAiMessageFromCoverLetterText(withPlain).includes(AI_COVER_LETTER_MESSAGE));
   });
 });
 
@@ -477,6 +555,33 @@ describe('textToPdfBuffer (step 5)', () => {
   it('handles empty string', async () => {
     const buf = await textToPdfBuffer('');
     assert.ok(Buffer.isBuffer(buf));
+  });
+
+  it('wraps long lines so PDF text does not run off the page', async () => {
+    const { PDFDocument, StandardFonts } = require('pdf-lib');
+    const pdfDoc = await PDFDocument.create();
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontSize = 11;
+    const margin = 50;
+    const pageWidth = 595;
+    const contentWidth = pageWidth - 2 * margin;
+
+    const longLine =
+      'I am excited to apply for the Junior Web Designer role at Education Web Solutions Pty Ltd, where I can utilize my skills.';
+    const wrapped = wrapLineForPdf(longLine, contentWidth, font, fontSize);
+
+    assert.ok(wrapped.length >= 2, 'long line should wrap into multiple lines');
+    for (const segment of wrapped) {
+      const w = font.widthOfTextAtSize(segment, fontSize);
+      assert.ok(
+        w <= contentWidth + 1,
+        `wrapped segment "${segment.slice(0, 30)}..." width ${w} should be <= contentWidth ${contentWidth}`
+      );
+    }
+
+    const buf = await textToPdfBuffer(longLine);
+    assert.ok(Buffer.isBuffer(buf));
+    assert.ok(buf.length > 100, 'PDF with wrapped long line should have content');
   });
 });
 

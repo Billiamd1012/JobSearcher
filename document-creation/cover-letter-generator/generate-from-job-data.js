@@ -151,7 +151,7 @@ async function main() {
         const prompt = buildPromptFromTemplate(job, context);
         console.log(`\nGenerating cover letter for: ${job.positionName} at ${job.company} (prompt ${prompt.length} chars)...`);
         const responseText = await callOllamaGenerateWithRetry(prompt);
-        const cleaned = postProcessCoverLetterText(responseText);
+        const cleaned = postProcessCoverLetterText(responseText, { applicantName });
         const folderName = getJobId(job, entry.path);
         const jobFolderPath = path.join(resolvedOutputDir, folderName);
         const fileBasename = generateCoverLetterBasename(job, {

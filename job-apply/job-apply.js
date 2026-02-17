@@ -19,10 +19,12 @@ require('dotenv').config({ path: path.join(PROJECT_ROOT, 'config', '.env') });
 const { chromium } = require('playwright');
 const { GmailManager } = require(path.join(PROJECT_ROOT, 'gmail-api'));
 const { SheetsManager } = require(path.join(PROJECT_ROOT, 'sheets-api'));
+const { runCoverLetterChecks } = require(path.join(PROJECT_ROOT, 'document-creation', 'cover-letter-generator', 'index.js'));
 
 const JOB_DATA_DIR = path.join(PROJECT_ROOT, 'job-data');
 const SCREENSHOTS_DIR = path.join(__dirname, 'screenshots');
 const COVER_LETTER_SCRIPT = path.join(PROJECT_ROOT, 'document-creation', 'cover-letter-generator', 'generate-from-job-data.js');
+const COVER_LETTER_OUT_DIR = path.join(PROJECT_ROOT, 'document-creation', 'documents', 'coverletter');
 const SEEK_ORIGIN = 'https://www.seek.com.au';
 
 const _verb = parseInt(process.env.VERBOSITY, 10);
@@ -35,11 +37,20 @@ function log(level, ...args) {
 const logStart = (...args) => log(1, ...args);
 const logVerbose = (...args) => log(2, ...args);
 
-async function takeScreenshot(page, kind = 'screenshot') {
+/**
+ * Take a screenshot and save to job-apply/screenshots/.
+ * @param {import('playwright').Page} page
+ * @param {string} [kind] - Label (e.g. 'apply-upload-screen')
+ * @param {string} [id] - Optional id (e.g. job id) to make the filename easier to identify
+ * @returns {Promise<string|null>} Path to saved file or null
+ */
+async function takeScreenshot(page, kind = 'screenshot', id = '') {
   if (!page || page.isClosed()) return null;
   try {
     fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
-    const name = `${kind}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const idPart = id != null && String(id).trim() ? `${String(id).trim()}-` : '';
+    const name = `${kind}-${idPart}${timestamp}.png`;
     const filePath = path.join(SCREENSHOTS_DIR, name);
     await page.screenshot({ path: filePath, fullPage: false });
     logVerbose('Screenshot saved:', filePath);
@@ -101,14 +112,13 @@ async function getJobsToApply() {
 }
 
 /**
- * Generate cover letter for a job via the cover-letter-generator script.
+ * Generate cover letter for a job via generate-from-job-data script.
  */
 function generateCoverLetter(jobDataPath) {
   return new Promise((resolve, reject) => {
-    const outDir = path.join(PROJECT_ROOT, 'document-creation', 'documents', 'coverletter');
     const child = spawn(
       process.execPath,
-      [COVER_LETTER_SCRIPT, jobDataPath, '--out', outDir],
+      [COVER_LETTER_SCRIPT, jobDataPath, '--out', COVER_LETTER_OUT_DIR],
       { cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'] }
     );
     let stderr = '';
@@ -119,6 +129,28 @@ function generateCoverLetter(jobDataPath) {
     });
     child.on('error', reject);
   });
+}
+
+/**
+ * Resolve path to the PDF cover letter for this job. If not found, run generate-from-job-data then look again.
+ * @param {string} jobId - e.g. from job link /job/90276720
+ * @param {string} jobDataPath - path to job JSON
+ * @returns {Promise<string>} - absolute path to coverletter.pdf
+ */
+async function getCoverLetterPdfPath(jobId, jobDataPath) {
+  const jobFolder = path.join(COVER_LETTER_OUT_DIR, jobId);
+  const findPdf = () => {
+    if (!fs.existsSync(jobFolder)) return null;
+    const files = fs.readdirSync(jobFolder).filter((f) => f.endsWith('.pdf'));
+    return files.length > 0 ? path.join(jobFolder, files[0]) : null;
+  };
+  let pdfPath = findPdf();
+  if (pdfPath) return pdfPath;
+  logStart('Cover letter PDF not found. Running generate-from-job-data...');
+  await generateCoverLetter(jobDataPath);
+  pdfPath = findPdf();
+  if (!pdfPath) throw new Error(`Cover letter PDF still missing after generation. Check ${jobFolder}`);
+  return pdfPath;
 }
 
 /**
@@ -233,6 +265,7 @@ async function main() {
   let page = null;
   let applicationTab = null;
   const applicationTabs = [];
+  let pausedForVerification = false;
   const SEEK_URL = 'https://www.seek.com.au/';
 
   try {
@@ -394,11 +427,11 @@ async function main() {
     if (!isSeekUrl(currentUrl)) {
       logStart('External redirect detected. Closing tab and skipping (not marking as applied).');
       await applicationTab.close().catch(() => {});
-      await takeScreenshot(page, 'external-redirect');
+      await takeScreenshot(page, 'external-redirect', jobId);
       return;
     }
 
-    await takeScreenshot(applicationTab, 'job-page');
+    await takeScreenshot(applicationTab, 'job-page', jobId);
 
     const applyLink = applicationTab.getByRole('link', { name: /quick apply|apply/i }).first();
     const applyButton = applicationTab.getByRole('button', { name: /quick apply|apply/i }).first();
@@ -416,7 +449,7 @@ async function main() {
     if (!isSeekUrl(afterApplyUrl)) {
       logStart('Redirected to external site after Apply. Closing tab and skipping.');
       await applicationTab.close().catch(() => {});
-      await takeScreenshot(page, 'external-after-apply');
+      await takeScreenshot(page, 'external-after-apply', jobId);
       return;
     }
 
@@ -429,9 +462,51 @@ async function main() {
     if (hasUpload) {
       logStart('Reached screen with cover letter/resume upload or select.');
     }
-    await takeScreenshot(applicationTab, 'apply-upload-screen');
-    logStart('Supervised run: stopped at upload/select screen. No application submitted.');
-    logStart('Check job-apply/screenshots/ for the captured page.');
+    await takeScreenshot(applicationTab, 'apply-upload-screen', jobId);
+
+    // Leave resume as default (no change). Scroll to cover letter, select "Upload a cover letter", upload PDF, then pause.
+    const coverLetterHeading = applicationTab.getByText(/cover letter/i).first();
+    await coverLetterHeading.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 500));
+
+    const uploadCoverLetterOption = applicationTab.getByRole('radio', { name: /upload a cover letter/i }).first();
+    await uploadCoverLetterOption.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
+    await uploadCoverLetterOption.click();
+    await new Promise((r) => setTimeout(r, 800));
+
+    const pdfPath = await getCoverLetterPdfPath(jobId, jobDataPath);
+    logStart('Using cover letter PDF:', pdfPath);
+
+    const jobFolder = path.dirname(pdfPath);
+    const txtFiles = fs.existsSync(jobFolder) ? fs.readdirSync(jobFolder).filter((f) => f.endsWith('.txt')) : [];
+    const txtPath = txtFiles.length > 0 ? path.join(jobFolder, txtFiles[0]) : null;
+    if (!txtPath) throw new Error(`Cover letter .txt not found in ${jobFolder}`);
+    const coverLetterText = fs.readFileSync(txtPath, 'utf-8');
+    const check = runCoverLetterChecks(coverLetterText);
+    if (!check.ok) {
+      const msg = `Cover letter failed checks: ${check.errors.join('; ')}`;
+      logStart(msg);
+      throw new Error(msg);
+    }
+    logStart('Cover letter checks passed.');
+
+    const coverLetterFileInput = applicationTab
+      .locator('section, [role="group"], div')
+      .filter({ has: applicationTab.getByText(/cover letter/i).first() })
+      .locator('input[type="file"]')
+      .first();
+    await coverLetterFileInput.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+    const fileInput = applicationTab.locator('input[type="file"]');
+    const count = await fileInput.count();
+    const coverLetterInput = count >= 2 ? fileInput.nth(1) : fileInput.first();
+    await coverLetterInput.setInputFiles(pdfPath, { timeout: 5000 });
+
+    await new Promise((r) => setTimeout(r, 1000));
+    await takeScreenshot(applicationTab, 'cover-letter-uploaded');
+
+    pausedForVerification = true;
+    logStart('Pausing on this page for verification. Close the browser or press Ctrl+C when done.');
+    await new Promise(() => {});
   } catch (err) {
     let errMsg = err.message || String(err);
     if (page && !page.isClosed()) {
@@ -439,17 +514,17 @@ async function main() {
         const u = await page.url();
         if (u) errMsg += ` (page URL: ${u})`;
       } catch (_) {}
-      const screenshotPath = await takeScreenshot(page, 'error');
+      const screenshotPath = await takeScreenshot(page, 'error', jobId);
       if (screenshotPath) logStart('Error screenshot saved:', screenshotPath);
     }
     if (applicationTab && applicationTab !== page && !applicationTab.isClosed()) {
-      const tabScreenshotPath = await takeScreenshot(applicationTab, 'error-application-tab');
+      const tabScreenshotPath = await takeScreenshot(applicationTab, 'error-application-tab', jobId);
       if (tabScreenshotPath) logStart('Error screenshot (application tab) saved:', tabScreenshotPath);
     }
     logStart('Error:', errMsg);
     throw err;
   } finally {
-    if (browser) await browser.close();
+    if (browser && !pausedForVerification) await browser.close();
   }
 }
 
