@@ -27,7 +27,7 @@
 
 ## 3. PROMPT CONSTRUCTION
 
-- Load or build a cover-letter prompt template (e.g. from `document-creation/cover-letter-generator/prompts/` or inline).
+- Load or build a cover-letter prompt template (e.g. from `document-creation/documents/prompts/` or inline).
 - Template placeholders: company name, role title, job description (full or summarised), applicant name/context, resume snippet.
 - Optionally truncate or summarise the job description to fit context window.
 - Build the final prompt string (system + user, or single user message, depending on LLM API).

@@ -1,22 +1,13 @@
 /**
- * Cover Letter Generator — Steps 1–7
+ * Cover Letter Generator — library of tools for creating cover letter documents.
  *
- * Step 1: Setup / entry point. Step 2: Local LLM lifecycle (Ollama).
- * Step 3: Prompt construction. Step 4: Call Ollama (with optional retry).
- * Step 5: Post-process output; for each job create a folder with coverletter.txt, coverletter.docx, coverletter.pdf.
- * Step 6: Cleanup — optionally stop Ollama if we started it (COVER_LETTER_STOP_OLLAMA=1).
- * Step 7: Edge cases — multiple jobs, OLLAMA_MODEL, optional resume, retry/backoff.
+ * Steps 2–7: Ollama lifecycle, prompt construction, LLM call (with retry), post-process, write .txt/.docx/.pdf, cleanup.
+ * This module does not load job data or run a CLI; it only exports functions and constants.
  *
- * Usage:
- *   node document-creation/cover-letter-generator [jobDataPath] [--resume path] [--out path]
- *   jobDataPath: path to a single job JSON file or to job-data/ directory (default: job-data/)
- *   --resume path: optional path to resume text file
- *   --out path: output directory for cover letters (default: document-creation/documents/coverletter)
+ * To generate from the job-data folder, run: node document-creation/cover-letter-generator/generate-from-job-data.js
  *
- * Requires Ollama installed and (unless already running) available on PATH for spawning.
- * Env: OLLAMA_MODEL (default: llama3.2), OLLAMA_BASE_URL; COVER_LETTER_OUTPUT_FORMAT (txt|docx);
- * APPLICANT_NAME or APPLICANT_LAST_NAME for output filename; COVER_LETTER_STOP_OLLAMA=1 to kill Ollama on exit;
- * OLLAMA_RETRY_ATTEMPTS, OLLAMA_RETRY_DELAY_MS for step 7 retry/backoff.
+ * Env: OLLAMA_MODEL, OLLAMA_BASE_URL, COVER_LETTER_OUTPUT_FORMAT, APPLICANT_NAME, APPLICANT_LAST_NAME,
+ * COVER_LETTER_STOP_OLLAMA, OLLAMA_RETRY_ATTEMPTS, OLLAMA_RETRY_DELAY_MS.
  */
 
 const path = require('path');
@@ -30,12 +21,41 @@ const { PDFDocument, StandardFonts } = require('pdf-lib');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const DOCUMENTS_DIR = path.join(__dirname, '..', 'documents');
-const DEFAULT_JOB_DATA = path.join(PROJECT_ROOT, 'job-data');
 const DEFAULT_OUTPUT_DIR = path.join(DOCUMENTS_DIR, 'coverletter');
 const DEFAULT_RESUME_DIR = path.join(DOCUMENTS_DIR, 'resume');
 const DEFAULT_COVERLETTER_DIR = path.join(DOCUMENTS_DIR, 'coverletter');
 const DEFAULT_APPLICANT_DETAILS_DIR = path.join(DOCUMENTS_DIR, 'details', 'applicant-details');
-const DEFAULT_PROMPT_PATH = path.join(__dirname, 'prompts', 'cover-letter-default.txt');
+const DEFAULT_PROMPT_PATH = path.join(DOCUMENTS_DIR, 'prompts', 'cover-letter-default.txt');
+
+const DEFAULT_PROMPT_TEMPLATE = `You are a professional cover letter writer. Write a concise, tailored cover letter for the following job application. Use a formal but warm tone. Do not invent qualifications; align the letter with the candidate's background when provided.
+
+Company: {{company}}
+Role: {{positionName}}
+Location: {{location}}
+Job type: {{type}}
+
+Job description:
+---
+{{description}}
+---
+
+Applicant context (use only if provided):
+{{applicantName}}
+{{resumeSnippet}}
+
+{{coverLetterSection}}
+
+Instructions:
+- Address the letter to the hiring team or "Hiring Manager" if no name is given.
+- Open with a short paragraph stating the role and company you are applying to.
+- In one or two paragraphs, connect your experience and motivation to the role and company (use resume/context above if provided).
+- Close with a brief sign-off (e.g. "Yours sincerely") followed by a placeholder for the applicant's name: [Your full name] or the applicant name if provided.
+- Keep the letter to one page when possible (roughly 250–400 words).
+- Output only the cover letter text, no meta-commentary or markdown.
+
+Cover letter:
+`;
+
 const SUPPORTED_DOC_EXTENSIONS = ['.txt', '.docx', '.pdf'];
 const SAMPLE_COVER_LETTER_NAMES = [
   'sample.txt', 'sample.docx', 'sample.pdf',
@@ -59,30 +79,7 @@ const COVERLETTER_BASENAME = 'coverletter'; // inside each job folder: coverlett
 
 let ollamaProcess = null;
 
-// ---------- Step 1: Setup / Entry point ----------
-
-/**
- * Parse argv for jobDataPath, --resume, --out.
- * @param {string[]} argv
- * @returns {{ jobDataPath: string, resumePath: string | null, outputDir: string }}
- */
-function parseArgs(argv = process.argv.slice(2)) {
-  let jobDataPath = DEFAULT_JOB_DATA;
-  let resumePath = null;
-  let outputDir = DEFAULT_OUTPUT_DIR;
-
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--resume' && argv[i + 1]) {
-      resumePath = argv[++i];
-    } else if ((argv[i] === '--out' || argv[i] === '-o') && argv[i + 1]) {
-      outputDir = argv[++i];
-    } else if (!argv[i].startsWith('-')) {
-      jobDataPath = argv[i];
-    }
-  }
-
-  return { jobDataPath, resumePath, outputDir };
-}
+// ---------- Paths and file reading ----------
 
 /**
  * Resolve a path to absolute; if relative, resolve against PROJECT_ROOT.
@@ -94,34 +91,6 @@ function resolvePath(p) {
     p = path.resolve(PROJECT_ROOT, p);
   }
   return p;
-}
-
-/**
- * Load job data from a path (single file or directory of JSON files).
- * @param {string} jobDataPath - Path to a .json file or directory containing .json files
- * @returns {{ jobs: object[], path: string }[]} Array of { jobs: [job], path } for single file, or { jobs, path } per file
- */
-function loadJobData(jobDataPath) {
-  const resolved = resolvePath(jobDataPath);
-  const stat = fs.statSync(resolved);
-
-  if (stat.isFile()) {
-    const raw = fs.readFileSync(resolved, 'utf-8');
-    const job = JSON.parse(raw);
-    return [{ jobs: [job], path: resolved }];
-  }
-
-  if (stat.isDirectory()) {
-    const files = fs.readdirSync(resolved).filter((f) => f.endsWith('.json'));
-    return files.map((f) => {
-      const filePath = path.join(resolved, f);
-      const raw = fs.readFileSync(filePath, 'utf-8');
-      const job = JSON.parse(raw);
-      return { jobs: [job], path: filePath };
-    });
-  }
-
-  throw new Error(`Job data path is neither file nor directory: ${resolved}`);
 }
 
 /**
@@ -358,12 +327,24 @@ async function ensureOllamaRunning(options = {}) {
 }
 
 /**
+ * Ensure the default prompt file exists; if not, create it from DEFAULT_PROMPT_TEMPLATE.
+ */
+function ensurePromptFileExists() {
+  if (!fs.existsSync(DEFAULT_PROMPT_PATH)) {
+    const dir = path.dirname(DEFAULT_PROMPT_PATH);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(DEFAULT_PROMPT_PATH, DEFAULT_PROMPT_TEMPLATE, 'utf-8');
+  }
+}
+
+/**
  * Load the default prompt template and replace placeholders.
  * @param {object} job - Job object with positionName, company, description, etc.
  * @param {{ applicantName?: string, resumeSnippet?: string, sampleCoverLetter?: string }} [context]
  * @returns {string}
  */
 function buildPromptFromTemplate(job, context = {}) {
+  ensurePromptFileExists();
   let template = fs.readFileSync(DEFAULT_PROMPT_PATH, 'utf-8');
 
   const description = (job.description || '').slice(0, 12000);
@@ -487,7 +468,42 @@ function postProcessCoverLetterText(raw) {
 }
 
 /**
- * Generate output folder name for a job: YYMMDD.LastName.CL.CompanyName (no extension).
+ * Get job ID from job.link (e.g. seek.com.au/job/90276720) or from entry file path stem.
+ * @param {object} job - Job with optional link, id
+ * @param {string} [entryPath] - Path to the job JSON file (e.g. .../job-data/90276720.json)
+ * @returns {string} Job id for use as folder name
+ */
+function getJobId(job, entryPath) {
+  if (job.id != null && String(job.id).trim()) return String(job.id).trim();
+  const link = (job.link || '').trim();
+  const m = link.match(/\/job\/(\d+)/);
+  if (m) return m[1];
+  if (entryPath) {
+    const stem = path.basename(entryPath, path.extname(entryPath));
+    if (stem) return stem;
+  }
+  return 'job';
+}
+
+/**
+ * Generate cover letter file basename: DOB.LastName.Company (no extension).
+ * DOB is YYYYMMDD from applicant details; use 00000000 if missing.
+ * @param {object} job - Job with company
+ * @param {{ applicantLastName?: string, applicantDob?: string }} [opts] - applicantDob e.g. "2003-12-10"
+ * @returns {string} Basename for .txt, .docx, .pdf files
+ */
+function generateCoverLetterBasename(job, opts = {}) {
+  const dobRaw = (opts.applicantDob || '').trim();
+  const digits = dobRaw ? dobRaw.replace(/-/g, '') : '';
+  const dobPart = digits.length >= 6 ? digits.slice(-6) : '000000'; // YYMMDD (e.g. 031210)
+  const lastName = (opts.applicantLastName || '').trim().replace(/\s+/g, '') || 'Applicant';
+  const companySlug = (job.company || 'Company').replace(/\s+/g, '').replace(/[^\w\-]/g, '') || 'Company';
+  return `${dobPart}.${lastName}.${companySlug}`;
+}
+
+/**
+ * Generate output folder name for a job (legacy: YYMMDD.LastName.CL.CompanyName).
+ * Prefer using getJobId(job, entryPath) for folder name and generateCoverLetterBasename for file names.
  * @param {object} job - Job with company, positionName, etc.
  * @param {{ applicantLastName?: string }} [opts]
  * @returns {string} Folder name only (no path)
@@ -573,14 +589,16 @@ async function textToPdfBuffer(text) {
 
 /**
  * Write cover letter to a job folder in three formats: .txt, .docx, .pdf.
- * Creates the folder if needed; writes coverletter.txt, coverletter.docx, coverletter.pdf.
- * @param {string} folderPath - Absolute path to the job folder (e.g. outputDir/YYMMDD.LastName.CL.Company)
+ * Creates the folder if needed. File names use basename from opts, or COVERLETTER_BASENAME.
+ * @param {string} folderPath - Absolute path to the job folder (e.g. outputDir/90276720)
  * @param {string} text - Plain text content
+ * @param {{ basename?: string }} [opts] - Basename for files (no extension); e.g. 20031210.Darker.CompanySlug
  * @returns {Promise<{ txtPath: string, docxPath: string, pdfPath: string }>}
  */
-async function writeCoverLetterToFolder(folderPath, text) {
+async function writeCoverLetterToFolder(folderPath, text, opts = {}) {
   fs.mkdirSync(folderPath, { recursive: true });
-  const base = path.join(folderPath, COVERLETTER_BASENAME);
+  const fileBasename = (opts.basename && String(opts.basename).trim()) || COVERLETTER_BASENAME;
+  const base = path.join(folderPath, fileBasename);
   const txtPath = base + '.txt';
   const docxPath = base + '.docx';
   const pdfPath = base + '.pdf';
@@ -653,94 +671,11 @@ async function callOllamaGenerateWithRetry(prompt, opts = {}) {
   throw lastErr;
 }
 
-// ---------- Main ----------
-
-async function main() {
-  const { jobDataPath, resumePath, outputDir } = parseArgs();
-
-  console.log('Cover letter generator (steps 1 & 2)');
-  console.log('Job data path:', jobDataPath);
-  console.log('Output dir:', outputDir);
-  if (resumePath) console.log('Resume path:', resumePath);
-
-  // Step 1
-  const resolvedJobPath = resolvePath(jobDataPath);
-  if (!fs.existsSync(resolvedJobPath)) {
-    throw new Error(`Job data path does not exist: ${resolvedJobPath}`);
-  }
-
-  const jobDataEntries = loadJobData(resolvedJobPath);
-  const resumeText = await loadResume(resumePath);
-  const sampleCoverLetter = await loadSampleCoverLetter();
-  const resolvedOutputDir = ensureOutputDir(outputDir);
-
-  if (resumeText) console.log('Resume: loaded from', resumePath || DEFAULT_RESUME_DIR);
-  else if (resumePath) console.log('Resume path:', resumePath, '(file not found or empty)');
-  if (sampleCoverLetter) console.log('Sample cover letter: loaded from', DEFAULT_COVERLETTER_DIR);
-  console.log(`Loaded ${jobDataEntries.length} job file(s). Output directory: ${resolvedOutputDir}`);
-
-  // Step 2
-  const { startedByUs } = await ensureOllamaRunning({ spawnIfNeeded: true });
-  console.log('LLM backend:', startedByUs ? 'Ollama (started by this script)' : 'Ollama (already running)');
-  console.log('Model:', OLLAMA_MODEL);
-
-  // Step 3–5: Build prompt, call Ollama (with retry), post-process, write folder per job (.txt, .docx, .pdf)
-  const applicantDetails = loadApplicantDetails();
-  const applicantName =
-    (applicantDetails.applicantName && String(applicantDetails.applicantName).trim()) ||
-    process.env.APPLICANT_NAME ||
-    '';
-  const applicantLastName =
-    (applicantDetails.lastName && String(applicantDetails.lastName).trim()) ||
-    (applicantName ? applicantName.trim().split(/\s+/).pop() : '') ||
-    getApplicantLastName();
-  const context = {
-    applicantName,
-    resumeSnippet: resumeText,
-    sampleCoverLetter,
-  };
-  const results = [];
-
-  try {
-    for (const entry of jobDataEntries) {
-      for (const job of entry.jobs) {
-        const prompt = buildPromptFromTemplate(job, context);
-        console.log(`\nGenerating cover letter for: ${job.positionName} at ${job.company} (prompt ${prompt.length} chars)...`);
-        const responseText = await callOllamaGenerateWithRetry(prompt);
-        const cleaned = postProcessCoverLetterText(responseText);
-        const folderName = generateOutputFolderName(job, { applicantLastName });
-        const jobFolderPath = path.join(resolvedOutputDir, folderName);
-        const { txtPath, docxPath, pdfPath } = await writeCoverLetterToFolder(jobFolderPath, cleaned);
-        results.push({
-          job,
-          entryPath: entry.path,
-          responseText: cleaned,
-          outputFolder: jobFolderPath,
-          txtPath,
-          docxPath,
-          pdfPath,
-        });
-        console.log(`  Folder: ${jobFolderPath}`);
-        console.log(`    ${path.basename(txtPath)}, ${path.basename(docxPath)}, ${path.basename(pdfPath)}`);
-      }
-    }
-
-    console.log(`\nGenerated ${results.length} cover letter(s).`);
-    results.forEach((r) => console.log('  ', r.outputFolder));
-  } finally {
-    cleanupOllamaIfStarted();
-  }
-}
-
-if (require.main === module) {
-  main().catch((err) => {
-    console.error(err);
-    if (ollamaProcess) ollamaProcess.kill();
-    process.exit(1);
-  });
-}
-
 module.exports = {
+  resolvePath,
+  ensureOutputDir,
+  ensureOllamaRunning,
+  DEFAULT_OUTPUT_DIR,
   readTextFromFile,
   loadResume,
   loadSampleCoverLetter,
@@ -748,6 +683,8 @@ module.exports = {
   callOllamaGenerate,
   callOllamaGenerateWithRetry,
   postProcessCoverLetterText,
+  getJobId,
+  generateCoverLetterBasename,
   generateOutputFolderName,
   generateOutputFilename,
   writeCoverLetter,

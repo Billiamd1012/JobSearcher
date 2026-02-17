@@ -15,7 +15,9 @@ screenshots/
 
 # Generated documents (cover letters, resumes); applicant-details folder contents are private
 document-creation/documents/*
-# Un-ignore details/ so negation of template file can take effect; keep applicant-details/ ignored
+# Un-ignore details/ and prompts/ so template files can be committed
 !document-creation/documents/details/
 !document-creation/documents/details/applicant-details-template.md
 document-creation/documents/details/applicant-details/
+!document-creation/documents/prompts/
+!document-creation/documents/prompts/cover-letter-default.txt

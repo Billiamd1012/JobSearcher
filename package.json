@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.js",
-    "cover-letter": "node document-creation/cover-letter-generator/index.js"
+    "cover-letter": "node document-creation/cover-letter-generator/generate-from-job-data.js"
   },
   "keywords": [],
   "author": "",

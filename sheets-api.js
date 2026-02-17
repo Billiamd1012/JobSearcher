@@ -16,9 +16,21 @@ const TOKEN_PATH = path.join(__dirname, 'config', 'token.json');
 const JOBS_SHEET_ID = process.env.JOBS_SHEET_ID || '';
 
 /**
- * Build a row array for the Jobs sheet from a job object. Validates input.
- * @param {object} job - { positionName, company?, posted?, type?, location?, link? }
- * @returns {[string, string, string, string, string, string, string, string, string]} - Row for A:I
+ * Jobs sheet columns (A:P): ID, Position name, Company, Want, Posted, Expiry Date,
+ * Genre, Type, Location, Link, Applied, Application date, Rejected, Rejected Date, Expired, Expired date.
+ * buildJobRow fills only the columns we have; others are left empty.
+ */
+const JOBS_SHEET_COLUMNS = [
+  'ID', 'Position name', 'Company', 'Want', 'Posted', 'Expiry Date',
+  'Genre', 'Type', 'Location', 'Link', 'Applied', 'Application date',
+  'Rejected', 'Rejected Date', 'Expired', 'Expired date',
+];
+
+/**
+ * Build a row array for the Jobs sheet from a job object. All 16 columns (A:P) are present;
+ * columns we do not set are empty strings.
+ * @param {object} job - { positionName, company?, posted?, expiry?, genre?, type?, location?, link? }
+ * @returns {string[]} - Row for A:P
  * @throws {Error} if job is null, undefined, or not a plain object
  */
 function buildJobRow(job) {
@@ -31,10 +43,29 @@ function buildJobRow(job) {
   const positionName = String(job.positionName ?? '');
   const company = String(job.company ?? '');
   const posted = String(job.posted ?? '');
+  const expiry = String(job.expiry ?? '');
+  const genre = String(job.genre ?? '');
   const type = String(job.type ?? '');
   const location = String(job.location ?? '');
   const link = String(job.link ?? '');
-  return [positionName, company, '', posted, '', '', type, location, link];
+  return [
+    '',             // A: ID
+    positionName,   // B: Position name
+    company,        // C: Company
+    '',             // D: Want
+    posted,         // E: Posted
+    expiry,         // F: Expiry Date
+    genre,          // G: Genre
+    type,           // H: Type
+    location,       // I: Location
+    link,           // J: Link
+    '',             // K: Applied
+    '',             // L: Application date
+    '',             // M: Rejected
+    '',             // N: Rejected Date
+    '',             // O: Expired
+    '',             // P: Expired date
+  ];
 }
 
 class SheetsManager {
@@ -125,19 +156,18 @@ class SheetsManager {
 
   /**
    * Get job rows that are not marked as applied and have a Seek job ID in the link.
-   * Assumes columns A:I = Position, Company, Want, Posted, Expiry, Genre, Type, Location, Link;
-   * optional column J = Applied (truthy = applied). Skips rows with no /job/NNN/ in Link (pre-automation).
+   * Columns: A=ID, B=Position name, C=Company, … J=Link, K=Applied. Skips rows with no /job/NNN/ in Link.
    * @param {string} [spreadsheetId]
    * @param {string} [sheetName] - e.g. 'Sheet1'
    * @returns {Promise<Array<{ rowIndex: number, jobId: string, link: string, positionName: string, company: string }>>}
    */
   async getUnappliedJobs(spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
-    const rows = await this.getValues(`${sheetName}!A:J`, spreadsheetId);
+    const rows = await this.getValues(`${sheetName}!A:K`, spreadsheetId);
     const out = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      const link = (row[8] && String(row[8]).trim()) || '';
-      const applied = (row[9] && String(row[9]).trim()) || '';
+      const link = (row[9] && String(row[9]).trim()) || '';
+      const applied = (row[10] && String(row[10]).trim()) || '';
       if (/^\s*y(es)?|1|true\s*$/i.test(applied)) continue;
       const idMatch = link.match(/\/job\/(\d+)/);
       if (!idMatch) continue;
@@ -146,16 +176,16 @@ class SheetsManager {
         rowIndex: i + 1,
         jobId,
         link: link.startsWith('http') ? link : `https://www.seek.com.au${link.startsWith('/') ? link : '/' + link}`,
-        positionName: (row[0] && String(row[0]).trim()) || '',
-        company: (row[1] && String(row[1]).trim()) || '',
+        positionName: (row[1] && String(row[1]).trim()) || '',
+        company: (row[2] && String(row[2]).trim()) || '',
       });
     }
     return out;
   }
 
   /**
-   * Append one job row to the Jobs sheet. Columns: A=Position name, B=Company, C=Want, D=Posted, E=Expiry, F=Genre, G=Type, H=Location, I=Link.
-   * @param {object} job - { positionName, company, posted, type, location, link }
+   * Append one job row to the Jobs sheet. Writes all columns A:P; unfilled columns are empty.
+   * @param {object} job - { positionName, company, posted?, expiry?, genre?, type, location, link }
    * @param {string} [spreadsheetId]
    * @param {string} [range] - e.g. 'Sheet1' or 'Jobs'
    */
@@ -165,7 +195,7 @@ class SheetsManager {
     try {
       await this.sheets.spreadsheets.values.append({
         spreadsheetId,
-        range: `${range}!A:I`,
+        range: `${range}!A:P`,
         valueInputOption: 'USER_ENTERED',
         insertDataOption: 'INSERT_ROWS',
         requestBody: { values },

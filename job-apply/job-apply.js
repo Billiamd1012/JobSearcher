@@ -22,7 +22,7 @@ const { SheetsManager } = require(path.join(PROJECT_ROOT, 'sheets-api'));
 
 const JOB_DATA_DIR = path.join(PROJECT_ROOT, 'job-data');
 const SCREENSHOTS_DIR = path.join(__dirname, 'screenshots');
-const COVER_LETTER_SCRIPT = path.join(PROJECT_ROOT, 'document-creation', 'cover-letter-generator', 'index.js');
+const COVER_LETTER_SCRIPT = path.join(PROJECT_ROOT, 'document-creation', 'cover-letter-generator', 'generate-from-job-data.js');
 const SEEK_ORIGIN = 'https://www.seek.com.au';
 
 const _verb = parseInt(process.env.VERBOSITY, 10);
@@ -230,8 +230,10 @@ function isSeekUrl(url) {
 
 async function main() {
   let browser;
+  let page = null;
   let applicationTab = null;
   const applicationTabs = [];
+  const SEEK_URL = 'https://www.seek.com.au/';
 
   try {
     logStart('Job Apply starting (supervised — will not submit applications).');
@@ -241,7 +243,7 @@ async function main() {
       logStart('No jobs to apply for (sheet has no unapplied jobs with job-data, or job-data is empty).');
       return;
     }
-    logStart(`Processing ${jobs.length} job(s). Using first job in job-data to get started.`);
+    logStart(`Processing ${jobs.length} job(s).`);
 
     const first = jobs[0];
     const { jobId, link, positionName, company, jobDataPath } = first;
@@ -252,37 +254,128 @@ async function main() {
     await generateCoverLetter(jobDataPath);
     logStart('Cover letter generated.');
 
+    // --- Same workflow as search script: setup, navigate, login (up until search form) ---
     logVerbose('Stage: launch browser');
     browser = await chromium.launch({ headless: false });
     const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     });
-    let page = await context.newPage();
+    page = await context.newPage();
+    logVerbose('Stage: setup — page created');
 
-    logVerbose('Stage: goto Seek home and wait for page');
-    await page.goto(SEEK_ORIGIN + '/', { waitUntil: 'domcontentloaded' });
+    // --- Navigate to Seek (same as search) ---
+    logVerbose('Stage: navigate — goto Seek home');
+    await page.goto(SEEK_URL, { waitUntil: 'domcontentloaded' });
+    logVerbose('Stage: navigate — waiting for networkidle (with 15s fallback) and page ready');
     await waitForNetworkIdleOrTimeout(page, 15000);
     await waitForPageReady(page, 5000);
-
+    logVerbose('Stage: navigate — waiting for "Perform a job search" heading');
     const headingVisible = await page
       .getByRole('heading', { name: /perform a job search/i })
       .waitFor({ state: 'visible', timeout: 15000 })
       .then(() => true)
       .catch(() => false);
+    expectPage(headingVisible, 'home page with "Perform a job search" heading');
+    logVerbose('Stage: navigate — home page ready');
 
-    if (!headingVisible) {
-      const onLogin = await page.getByLabel(/email address/i).isVisible().catch(() => false);
-      if (onLogin) {
-        logVerbose('Stage: login required');
-        await seekLogin(page);
-        await waitForPageReady(page, 5000);
-        await page.goto(SEEK_ORIGIN + '/', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-        await waitForPageReady(page, 5000);
+    // --- Dismiss login popup: same as search (Continue with Email, or click Sign in to open it) ---
+    logVerbose('Stage: login — dismiss popup (Continue with Email or Sign in)');
+    const continueWithEmail = page.getByRole('link', { name: /continue with email/i });
+    try {
+      await continueWithEmail.waitFor({ state: 'visible', timeout: 8000 });
+      await continueWithEmail.click();
+    } catch {
+      await waitForPageReady(page, 2000);
+      const signInButton = page
+        .getByRole('link', { name: /sign in/i })
+        .or(page.getByRole('button', { name: /sign in/i }))
+        .or(page.getByText(/sign in/i).first());
+      await signInButton.first().waitFor({ state: 'attached', timeout: 10000 });
+      await signInButton.first().scrollIntoViewIfNeeded().catch(() => {});
+      const signInBox = await signInButton.first().boundingBox().catch(() => null);
+      if (signInBox) {
+        await page.mouse.click(signInBox.x + signInBox.width / 2, signInBox.y + signInBox.height / 2);
       } else {
-        expectPage(false, 'Seek home or login page');
+        await signInButton.first().click({ force: true });
+      }
+      await continueWithEmail.waitFor({ state: 'visible', timeout: 8000 });
+      const continueBox = await continueWithEmail.boundingBox().catch(() => null);
+      if (continueBox) {
+        await page.mouse.click(continueBox.x + continueBox.width / 2, continueBox.y + continueBox.height / 2);
+      } else {
+        await continueWithEmail.click();
       }
     }
+
+    // --- Fill email, request code, wait, Gmail, enter code (same as search) ---
+    const emailField = page.getByLabel(/email address/i);
+    await emailField.waitFor({ state: 'visible', timeout: 10000 });
+    expectPage(await emailField.isVisible().catch(() => false), 'login step: email address field visible');
+    await emailField.fill(process.env.LOGIN_EMAIL || '');
+
+    const emailSignInCodeButton = page.getByRole('button', { name: /email me a sign in code/i });
+    await emailSignInCodeButton.waitFor({ state: 'visible', timeout: 5000 });
+    expectPage(await emailSignInCodeButton.isVisible().catch(() => false), 'login step: "Email me a sign in code" button visible');
+    logVerbose('Stage: login — requesting sign-in code (email)');
+    await emailSignInCodeButton.click();
+
+    logVerbose('Stage: login — waiting for verification code input');
+    const codeInputWait = page.getByLabel(/code|verification/i).first();
+    await codeInputWait.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+
+    const waitSeconds = 10;
+    logVerbose(`Stage: login — waiting ${waitSeconds}s for verification email...`);
+    await new Promise((r) => setTimeout(r, waitSeconds * 1000));
+
+    const gmail = await GmailManager.fromClientSecret();
+    logStart('Checking Gmail for Seek verification code...');
+    const codes = await gmail.findSeekVerificationCodes({ maxMessages: 5 });
+    const latest = codes.length > 0 ? codes[0] : null;
+    if (latest) {
+      logStart('Seek verification code:', latest.code);
+      logVerbose('Stage: login — entering verification code');
+      const code = String(latest.code).replace(/\D/g, '').slice(0, 6);
+      const singleInput = page.locator('input[inputmode="numeric"]').or(
+        page.locator('input[type="tel"]').or(page.getByLabel(/code|verification|enter.*code/i).locator('input').first())
+      ).first();
+      const sixInputs = page.locator('input[inputmode="numeric"], input[type="tel"]');
+      const singleVisible = await singleInput.isVisible().catch(() => false);
+      const count = await sixInputs.count().catch(() => 0);
+      if (count >= 6) {
+        for (let i = 0; i < 6 && i < code.length; i++) {
+          const box = sixInputs.nth(i);
+          const b = await box.boundingBox().catch(() => null);
+          if (b) {
+            await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
+            await page.keyboard.type(code[i], { delay: 50 });
+          } else {
+            await box.fill(code[i]);
+          }
+        }
+      } else if (singleVisible) {
+        const codeBox = await singleInput.boundingBox().catch(() => null);
+        if (codeBox) await page.mouse.click(codeBox.x + codeBox.width / 2, codeBox.y + codeBox.height / 2);
+        else await singleInput.click();
+        await new Promise((r) => setTimeout(r, 300));
+        await singleInput.fill('', { timeout: 2000 }).catch(() => {});
+        await singleInput.fill(code, { timeout: 5000 });
+      } else {
+        const fallback = page.getByLabel(/code|verification/i).first();
+        if (await fallback.isVisible().catch(() => false)) {
+          const codeBox = await fallback.boundingBox().catch(() => null);
+          if (codeBox) await page.mouse.click(codeBox.x + codeBox.width / 2, codeBox.y + codeBox.height / 2);
+          else await fallback.click();
+          await new Promise((r) => setTimeout(r, 300));
+          await fallback.fill(code, { timeout: 5000 });
+        }
+      }
+    } else {
+      logStart('No Seek verification code found in recent emails.');
+    }
+
+    // --- Divergence: search script would fill search form here; we open job links in tabs instead ---
+    await waitForPageReady(page, 5000);
 
     const fullLink = link.startsWith('http') ? link : new URL(link, SEEK_ORIGIN).href;
 
@@ -341,15 +434,19 @@ async function main() {
     logStart('Check job-apply/screenshots/ for the captured page.');
   } catch (err) {
     let errMsg = err.message || String(err);
-    const page = applicationTab || null;
     if (page && !page.isClosed()) {
       try {
         const u = await page.url();
         if (u) errMsg += ` (page URL: ${u})`;
-      } catch {}
+      } catch (_) {}
+      const screenshotPath = await takeScreenshot(page, 'error');
+      if (screenshotPath) logStart('Error screenshot saved:', screenshotPath);
+    }
+    if (applicationTab && applicationTab !== page && !applicationTab.isClosed()) {
+      const tabScreenshotPath = await takeScreenshot(applicationTab, 'error-application-tab');
+      if (tabScreenshotPath) logStart('Error screenshot (application tab) saved:', tabScreenshotPath);
     }
     logStart('Error:', errMsg);
-    await takeScreenshot(applicationTab, 'error');
     throw err;
   } finally {
     if (browser) await browser.close();

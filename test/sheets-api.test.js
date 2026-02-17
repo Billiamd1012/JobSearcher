@@ -87,48 +87,42 @@ describe('SheetsManager', () => {
 
     it('normal use case 1: full job (Graduate DevOps/QA Engineer)', () => {
       const row = buildJobRow(NORMAL_JOBS[0]);
-      assert.deepStrictEqual(row, [
-        'Graduate DevOps/QA Engineer',
-        'PROFOUND',
-        '',
-        '22/01/2026',
-        '',
-        '',
-        'Full time',
-        'Adelaide',
-        'https://www.seek.com.au/job/89851615?ref=recom-homepage&pos=2&origin=showNewTab',
-      ]);
+      assert.strictEqual(row.length, 16);
+      assert.strictEqual(row[0], ''); // A: ID
+      assert.strictEqual(row[1], 'Graduate DevOps/QA Engineer'); // B: Position name
+      assert.strictEqual(row[2], 'PROFOUND'); // C: Company
+      assert.strictEqual(row[4], '22/01/2026'); // E: Posted
+      assert.strictEqual(row[7], 'Full time'); // H: Type
+      assert.strictEqual(row[8], 'Adelaide'); // I: Location
+      assert.ok(row[9].includes('seek.com.au/job/89851615')); // J: Link
     });
 
     it('normal use case 2: full job (Software Engineer)', () => {
       const row = buildJobRow(NORMAL_JOBS[1]);
-      assert.strictEqual(row[0], 'Software Engineer');
-      assert.strictEqual(row[1], 'Consunet');
-      assert.strictEqual(row[3], '22/1/26');
-      assert.strictEqual(row[6], 'Full time');
-      assert.strictEqual(row[7], 'Adelaide');
-      assert.ok(row[8].includes('seek.com.au/job/89293819'));
+      assert.strictEqual(row.length, 16);
+      assert.strictEqual(row[1], 'Software Engineer');
+      assert.strictEqual(row[2], 'Consunet');
+      assert.strictEqual(row[4], '22/1/26');
+      assert.strictEqual(row[7], 'Full time');
+      assert.strictEqual(row[8], 'Adelaide');
+      assert.ok(row[9].includes('seek.com.au/job/89293819'));
     });
 
     it('normal use case 3: full job (Web Developer)', () => {
       const row = buildJobRow(NORMAL_JOBS[2]);
-      assert.strictEqual(row[0], 'Web Developer');
-      assert.strictEqual(row[1], 'Refuel Creative');
-      assert.strictEqual(row[7], 'Port Adelaide');
-      assert.strictEqual(row.length, 9);
+      assert.strictEqual(row.length, 16);
+      assert.strictEqual(row[1], 'Web Developer');
+      assert.strictEqual(row[2], 'Refuel Creative');
+      assert.strictEqual(row[8], 'Port Adelaide');
     });
 
     it('coerces missing optional fields to empty string', () => {
       const row = buildJobRow({ positionName: 'Test', company: 'Co' });
-      assert.strictEqual(row[0], 'Test');
-      assert.strictEqual(row[1], 'Co');
-      assert.strictEqual(row[2], '');
-      assert.strictEqual(row[3], '');
-      assert.strictEqual(row[4], '');
-      assert.strictEqual(row[5], '');
-      assert.strictEqual(row[6], '');
-      assert.strictEqual(row[7], '');
-      assert.strictEqual(row[8], '');
+      assert.strictEqual(row.length, 16);
+      assert.strictEqual(row[0], '');
+      assert.strictEqual(row[1], 'Test');
+      assert.strictEqual(row[2], 'Co');
+      for (let i = 3; i < 16; i++) assert.strictEqual(row[i], '');
     });
   });
 
