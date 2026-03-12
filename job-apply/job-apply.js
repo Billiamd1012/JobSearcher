@@ -615,9 +615,13 @@ async function main() {
       continue;
     }
         logStart(`Job: ${positionName || '(no title)'} at ${company || '(no company)'} (${jobId})`);
+        if (process.env.JOB_APPLY_NO_GENERATE === '1' && !coverLetterExistsForJob(jobId)) {
+          logStart('No cover letter yet; skipping (JOB_APPLY_NO_GENERATE=1).');
+          continue;
+        }
         if (coverLetterExistsForJob(jobId)) {
           logStart('Cover letter already exists for this job, skipping generation.');
-        } else {
+        } else if (process.env.JOB_APPLY_NO_GENERATE !== '1') {
           logStart('Generating cover letter...');
           try {
             await Promise.race([

@@ -319,7 +319,7 @@ async function main() {
     // --- 1. SETUP ---
     logVerbose('Stage: setup — launching browser');
     browser = await chromium.launch({
-      headless: false,
+      headless: process.env.SEEK_HEADLESS === '1',
     });
     const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },

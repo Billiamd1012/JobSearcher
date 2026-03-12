@@ -99,6 +99,17 @@ function loadJobData(jobDataPath) {
   throw new Error(`Job data path is neither file nor directory: ${resolved}`);
 }
 
+/**
+ * True if the cover letter output folder already contains .pdf, .txt, or .docx (same rule as job-apply).
+ * @param {string} jobFolderPath - Absolute path to the job folder (e.g. outputDir/90276720)
+ * @returns {boolean}
+ */
+function coverLetterExistsForJob(jobFolderPath) {
+  if (!fs.existsSync(jobFolderPath)) return false;
+  const files = fs.readdirSync(jobFolderPath);
+  return files.some((f) => f.endsWith('.pdf') || f.endsWith('.txt') || f.endsWith('.docx'));
+}
+
 async function main() {
   const { jobDataPath, resumePath, outputDir } = parseArgs();
 
@@ -150,6 +161,12 @@ async function main() {
   try {
     for (const entry of jobDataEntries) {
       for (const job of entry.jobs) {
+        const folderName = getJobId(job, entry.path);
+        const jobFolderPath = path.join(resolvedOutputDir, folderName);
+        if (coverLetterExistsForJob(jobFolderPath)) {
+          console.log(`[cover letter] Skip (already exists): ${folderName}`);
+          continue;
+        }
         console.log(`\n[cover letter] Job: ${job.positionName || '(no title)'} at ${job.company || '(no company)'}`);
         console.log('[cover letter] Building prompt...');
         const prompt = buildPromptFromTemplate(job, context);
@@ -157,8 +174,6 @@ async function main() {
         const responseText = await callOllamaGenerateWithRetry(prompt);
         console.log('[cover letter] Ollama response received. Post-processing text...');
         const cleaned = postProcessCoverLetterText(responseText, { applicantName });
-        const folderName = getJobId(job, entry.path);
-        const jobFolderPath = path.join(resolvedOutputDir, folderName);
         const fileBasename = generateCoverLetterBasename(job, {
           applicantLastName,
           applicantDob,
