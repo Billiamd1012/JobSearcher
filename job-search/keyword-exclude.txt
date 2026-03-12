@@ -1,0 +1,9 @@
+# Words to exclude: if any of these appear in the job title, the job is not included in search results.
+# One word or phrase per line. Matching is case-insensitive.
+# Examples (uncomment or add your own):
+manager
+lead
+senior
+principal
+designer
+data entry

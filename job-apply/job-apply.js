@@ -2,7 +2,7 @@
  * Job Apply — Read unapplied jobs from the sheet (or first job in job-data for get started),
  * generate cover letter, navigate to job page, sign in if needed, click Apply, and get to the
  * screen where user selects/uploads cover letter and resume. Supervised: does not submit.
- * External redirects: close tab and skip without marking applied.
+ * External redirects / visit external site / new tab: skip but still add job to sheet with Applied=Yes.
  *
  * Run: node job-apply/job-apply.js
  * Uses first job in job-data to get started. Set JOB_APPLY_USE_SHEET=1 to use sheet unapplied list.
@@ -20,11 +20,13 @@ const { chromium } = require('playwright');
 const { GmailManager } = require(path.join(PROJECT_ROOT, 'gmail-api'));
 const { SheetsManager } = require(path.join(PROJECT_ROOT, 'sheets-api'));
 const { runCoverLetterChecks } = require(path.join(PROJECT_ROOT, 'document-creation', 'cover-letter-generator', 'index.js'));
+const { isJobAppliedFromCache } = require(path.join(PROJECT_ROOT, 'job-data', 'applied-status-cache.js'));
 
 const JOB_DATA_DIR = path.join(PROJECT_ROOT, 'job-data');
 const SCREENSHOTS_DIR = path.join(__dirname, 'screenshots');
 const COVER_LETTER_SCRIPT = path.join(PROJECT_ROOT, 'document-creation', 'cover-letter-generator', 'generate-from-job-data.js');
 const COVER_LETTER_OUT_DIR = path.join(PROJECT_ROOT, 'document-creation', 'documents', 'coverletter');
+const COVER_LETTER_GENERATE_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
 const SEEK_ORIGIN = 'https://www.seek.com.au';
 
 const _verb = parseInt(process.env.VERBOSITY, 10);
@@ -83,7 +85,7 @@ function expectPage(condition, stageDescription) {
 }
 
 /**
- * Get jobs to process. For get started: first job from job-data. With JOB_APPLY_USE_SHEET=1: unapplied from sheet that have job-data.
+ * Get jobs to process. Without sheet: all jobs from job-data (each .json with a link). With JOB_APPLY_USE_SHEET=1: unapplied from sheet that have job-data.
  */
 async function getJobsToApply() {
   if (useSheet) {
@@ -102,17 +104,34 @@ async function getJobsToApply() {
   if (files.length === 0) {
     throw new Error('No job JSON files in job-data/. Run job search first.');
   }
-  const firstFile = files[0];
-  const jobDataPath = path.join(JOB_DATA_DIR, firstFile);
-  const job = JSON.parse(fs.readFileSync(jobDataPath, 'utf-8'));
-  const jobId = firstFile.replace(/\.json$/, '');
-  const link = (job.link && job.link.trim()) || '';
-  if (!link) throw new Error(`First job ${firstFile} has no link.`);
-  return [{ jobId, link, positionName: job.positionName || '', company: job.company || '', job, jobDataPath }];
+  const out = [];
+  for (const file of files) {
+    const jobId = file.replace(/\.json$/, '');
+    if (isJobAppliedFromCache(jobId)) continue;
+    const jobDataPath = path.join(JOB_DATA_DIR, file);
+    const job = JSON.parse(fs.readFileSync(jobDataPath, 'utf-8'));
+    const link = (job.link && job.link.trim()) || '';
+    if (!link) continue;
+    out.push({ jobId, link, positionName: job.positionName || '', company: job.company || '', job, jobDataPath });
+  }
+  return out;
+}
+
+/**
+ * Check if a cover letter has already been created for this job (folder exists with .pdf, .txt, or .docx).
+ * @param {string} jobId - e.g. '90276720'
+ * @returns {boolean}
+ */
+function coverLetterExistsForJob(jobId) {
+  const jobFolder = path.join(COVER_LETTER_OUT_DIR, jobId);
+  if (!fs.existsSync(jobFolder)) return false;
+  const files = fs.readdirSync(jobFolder);
+  return files.some((f) => f.endsWith('.pdf') || f.endsWith('.txt') || f.endsWith('.docx'));
 }
 
 /**
  * Generate cover letter for a job via generate-from-job-data script.
+ * Forwards the child's stdout/stderr so you can monitor progress.
  */
 function generateCoverLetter(jobDataPath) {
   return new Promise((resolve, reject) => {
@@ -121,14 +140,170 @@ function generateCoverLetter(jobDataPath) {
       [COVER_LETTER_SCRIPT, jobDataPath, '--out', COVER_LETTER_OUT_DIR],
       { cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'] }
     );
+    if (child.stdout) child.stdout.on('data', (c) => process.stdout.write(c));
     let stderr = '';
-    child.stderr.on('data', (c) => { stderr += c; });
+    if (child.stderr) {
+      child.stderr.on('data', (c) => {
+        process.stderr.write(c);
+        stderr += c;
+      });
+    }
     child.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`Cover letter generator exited ${code}: ${stderr.slice(-500)}`));
     });
     child.on('error', reject);
   });
+}
+
+/**
+ * Scroll to the bottom of the page so the Continue button and any content below the fold are in view.
+ * @param {import('playwright').Page} page
+ */
+async function scrollToBottom(page) {
+  await page.evaluate(() => {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  });
+  await new Promise((r) => setTimeout(r, 400));
+}
+
+/**
+ * Perform a physical mouse click matching the Seek search pattern (boundingBox + mouse.click at center).
+ * Same approach used for "Continue with Email" and Sign in in seek-job-search.js.
+ * @param {import('playwright').Page} page
+ * @param {import('playwright').Locator} locator
+ */
+async function physicalClick(page, locator) {
+  await locator.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
+  await locator.scrollIntoViewIfNeeded().catch(() => {});
+  await new Promise((r) => setTimeout(r, 300));
+  const box = await locator.boundingBox().catch(() => null);
+  if (box) {
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  } else {
+    await locator.click({ force: true });
+  }
+}
+
+/** Max attempts to click Continue until Review and submit (Submit application button) is shown. (Multiple steps: Choose documents → Answer questions → Update profile → Review.) */
+const CONTINUE_CLICK_MAX_ATTEMPTS = 10;
+
+/**
+ * Click Continue repeatedly until the "Review and submit" step is shown (Submit application button visible at bottom).
+ * Stops when <button data-testid="review-submit-application"> is visible; then pauses for verification.
+ * @param {import('playwright').Page} applicationTab
+ * @param {string} jobId
+ */
+async function clickContinueUntilReviewSubmitPage(applicationTab, jobId) {
+  const submitApplicationBtn = applicationTab.getByTestId('review-submit-application');
+  const answerEmployerQuestion = applicationTab.getByText(/answer\s*(?:employer|employee)\s*question/i).first();
+  const chooseDocuments = applicationTab.getByText(/choose\s*documents/i).first();
+  // Prefer the real <button data-testid="continue-button"> (Choose documents / application steps); fallback to span or role.
+  const continueBtn = applicationTab
+    .getByTestId('continue-button')
+    .or(applicationTab.getByRole('button', { name: /^continue$/i }))
+    .or(applicationTab.locator('span').filter({ has: applicationTab.locator('svg'), hasText: /^Continue$/i }))
+    .or(applicationTab.getByText('Continue', { exact: true }))
+    .first();
+
+  for (let attempt = 1; attempt <= CONTINUE_CLICK_MAX_ATTEMPTS; attempt++) {
+    const submitVisible = await submitApplicationBtn.isVisible().catch(() => false);
+    if (submitVisible) {
+      logStart('Submit application button (Review and submit) shown. Pausing for verification.');
+      await scrollToBottom(applicationTab);
+      await takeScreenshot(applicationTab, 'verification-page', jobId);
+      return;
+    }
+
+    logStart(`Clicking Continue (attempt ${attempt}/${CONTINUE_CLICK_MAX_ATTEMPTS})...`);
+    await scrollToBottom(applicationTab);
+    await physicalClick(applicationTab, continueBtn);
+    await applicationTab.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20000)); // 20 seconds between Continue attempts
+
+    const submitVisibleNow = await submitApplicationBtn.isVisible().catch(() => false);
+    if (submitVisibleNow) {
+      logStart('Submit application button (Review and submit) shown. Pausing for verification.');
+      await takeScreenshot(applicationTab, 'verification-page', jobId);
+      return;
+    }
+
+    const stillOnChooseDocs = await chooseDocuments.isVisible().catch(() => false);
+    const stillOnQuestions = await answerEmployerQuestion.isVisible().catch(() => false);
+    if (stillOnChooseDocs || stillOnQuestions) {
+      logStart(
+        stillOnChooseDocs
+          ? 'Still on Choose documents step — Continue did not register. Retrying.'
+          : 'Still on employer questions step — Continue did not register. Retrying.'
+      );
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  const submitVisibleFinal = await submitApplicationBtn.isVisible().catch(() => false);
+  if (submitVisibleFinal) {
+    logStart('Submit application button shown. Pausing for verification.');
+    await takeScreenshot(applicationTab, 'verification-page', jobId);
+    return;
+  }
+  logStart('Max Continue attempts reached. Pausing on current page for verification.');
+  await takeScreenshot(applicationTab, 'verification-page-after-retries', jobId);
+}
+
+/**
+ * Click the Submit application button (Review and submit step), wait for submission, then mark the job as applied in the sheet.
+ * Looks up the job by ID in the sheet: if found, updates Applied and Application date; if not found, appends a new row with job data and Applied=Yes.
+ * @param {import('playwright').Page} applicationTab
+ * @param {string} jobId - Seek job ID (e.g. from link /job/90276720)
+ * @param {object} job - Job object (positionName, company, link, ...) for appending if not in sheet
+ */
+async function clickSubmitApplicationAndMarkInSheet(applicationTab, jobId, job) {
+  const submitBtn = applicationTab
+    .getByTestId('review-submit-application')
+    .or(applicationTab.getByRole('button', { name: /submit\s*application/i }));
+  const visible = await submitBtn.first().isVisible().catch(() => false);
+  if (!visible) {
+    logStart('Submit application button not visible; skipping submit and sheet update.');
+    return;
+  }
+  logStart('Clicking Submit application...');
+  await scrollToBottom(applicationTab);
+  await physicalClick(applicationTab, submitBtn.first());
+  await applicationTab.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 3000));
+
+  if (jobId && job) {
+    try {
+      const sheets = await SheetsManager.fromClientSecret();
+      await sheets.markJobAsAppliedByIdOrAppend(jobId, job);
+      logStart('Recorded application in spreadsheet (found row: updated Applied; not found: added row with Applied=Yes).');
+    } catch (e) {
+      logStart('Could not record application in sheet:', e.message);
+    }
+  }
+
+  await takeScreenshot(applicationTab, 'application-submitted', jobId);
+}
+
+/**
+ * Find employer-style question fields (input not file/hidden, textarea, select) and return count and first unanswered 1-based index.
+ * @param {import('playwright').Page} page - Application tab
+ * @returns {Promise<{ questionCount: number, firstUnanswered1Based: number }>} - firstUnanswered1Based is 0 if all answered
+ */
+async function getQuestionFieldStatus(page) {
+  const questionFields = page.locator(
+    'input:not([type=file]):not([type=hidden]), textarea, select'
+  );
+  const count = await questionFields.count();
+  if (count === 0) return { questionCount: 0, firstUnanswered1Based: 0 };
+  for (let i = 0; i < count; i++) {
+    const el = questionFields.nth(i);
+    const visible = await el.isVisible().catch(() => false);
+    if (!visible) continue;
+    const value = await el.inputValue().catch(() => '');
+    if (!String(value).trim()) return { questionCount: count, firstUnanswered1Based: i + 1 };
+  }
+  return { questionCount: count, firstUnanswered1Based: 0 };
 }
 
 /**
@@ -260,16 +435,32 @@ function isSeekUrl(url) {
   }
 }
 
+/**
+ * When a job is skipped (external redirect, visit external site, or new tab), still add/update the job in the sheet with Applied=Yes.
+ * @param {string} jobId
+ * @param {object} job - job object for the row
+ */
+async function recordSkippedJobInSheet(jobId, job) {
+  if (!process.env.JOBS_SHEET_ID || !jobId) return;
+  try {
+    const sheets = await SheetsManager.fromClientSecret();
+    await sheets.markJobAsAppliedByIdOrAppend(jobId, job);
+    logStart('Recorded job in spreadsheet (Applied=Yes) — skipped (external/redirect).');
+  } catch (e) {
+    logStart('Could not record skipped job in sheet:', e.message);
+  }
+}
+
 async function main() {
   let browser;
   let page = null;
   let applicationTab = null;
+  let jobId = null; // set each iteration; used in catch for error screenshots when error occurs mid-loop
   const applicationTabs = [];
-  let pausedForVerification = false;
   const SEEK_URL = 'https://www.seek.com.au/';
 
   try {
-    logStart('Job Apply starting (supervised — will not submit applications).');
+    logStart('Job Apply starting — will apply for all job data entries.');
 
     const jobs = await getJobsToApply();
     if (jobs.length === 0) {
@@ -277,15 +468,6 @@ async function main() {
       return;
     }
     logStart(`Processing ${jobs.length} job(s).`);
-
-    const first = jobs[0];
-    const { jobId, link, positionName, company, jobDataPath } = first;
-
-    logStart(`Job: ${positionName || '(no title)'} at ${company || '(no company)'} (${jobId})`);
-
-    logStart('Generating cover letter...');
-    await generateCoverLetter(jobDataPath);
-    logStart('Cover letter generated.');
 
     // --- Same workflow as search script: setup, navigate, login (up until search form) ---
     logVerbose('Stage: launch browser');
@@ -410,7 +592,48 @@ async function main() {
     // --- Divergence: search script would fill search form here; we open job links in tabs instead ---
     await waitForPageReady(page, 5000);
 
-    const fullLink = link.startsWith('http') ? link : new URL(link, SEEK_ORIGIN).href;
+    for (const current of jobs) {
+      try {
+        jobId = current.jobId;
+        const { link, positionName, company, jobDataPath, rowIndex } = current;
+    if (process.env.JOBS_SHEET_ID) {
+      try {
+        if (isJobAppliedFromCache(jobId)) {
+          logStart(`Job ${jobId} already applied (per local cache). Skipping.`);
+          continue;
+        }
+        const sheets = await SheetsManager.fromClientSecret();
+        if (await sheets.isJobApplied(jobId)) {
+          logStart(`Job ${jobId} already applied (per spreadsheet). Skipping.`);
+          continue;
+        }
+      } catch (e) {
+        logStart('Could not check spreadsheet for already-applied; continuing:', e.message);
+      }
+    } else if (isJobAppliedFromCache(jobId)) {
+      logStart(`Job ${jobId} already applied (per local cache). Skipping.`);
+      continue;
+    }
+        logStart(`Job: ${positionName || '(no title)'} at ${company || '(no company)'} (${jobId})`);
+        if (coverLetterExistsForJob(jobId)) {
+          logStart('Cover letter already exists for this job, skipping generation.');
+        } else {
+          logStart('Generating cover letter...');
+          try {
+            await Promise.race([
+              generateCoverLetter(jobDataPath),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Cover letter generation timed out (3 minutes).')), COVER_LETTER_GENERATE_TIMEOUT_MS)
+              ),
+            ]);
+            logStart('Cover letter generated.');
+          } catch (genErr) {
+            logStart(`Cover letter generation failed or timed out: ${genErr.message || genErr}. Skipping to next job.`);
+            continue;
+          }
+        }
+
+        const fullLink = link.startsWith('http') ? link : new URL(link, SEEK_ORIGIN).href;
 
     if (applicationTabs.length >= 2) {
       const old = applicationTabs.shift();
@@ -425,10 +648,11 @@ async function main() {
 
     const currentUrl = applicationTab.url();
     if (!isSeekUrl(currentUrl)) {
-      logStart('External redirect detected. Closing tab and skipping (not marking as applied).');
+      logStart('External redirect detected. Closing tab and skipping; recording job in sheet with Applied=Yes.');
+      await takeScreenshot(applicationTab, 'external-redirect', jobId);
+      await recordSkippedJobInSheet(jobId, current.job);
       await applicationTab.close().catch(() => {});
-      await takeScreenshot(page, 'external-redirect', jobId);
-      return;
+      continue;
     }
 
     await takeScreenshot(applicationTab, 'job-page', jobId);
@@ -436,21 +660,47 @@ async function main() {
     const applyLink = applicationTab.getByRole('link', { name: /quick apply|apply/i }).first();
     const applyButton = applicationTab.getByRole('button', { name: /quick apply|apply/i }).first();
     const applyVisible = await applyLink.isVisible().catch(() => false) || await applyButton.isVisible().catch(() => false);
+
+    // Race: new tab opens (external) vs same-tab navigation (upload flow). Trigger click then see which happens first.
+    const newTabPromise = context.waitForEvent('page', { timeout: 12000 }).then((p) => ({ type: 'newtab', page: p }));
+    const loadPromise = applicationTab.waitForLoadState('domcontentloaded', { timeout: 15000 }).then(() => ({ type: 'load' }));
     if (applyVisible) {
-      await applyLink.click().catch(() => applyButton.click());
-      await waitForPageReady(applicationTab, 8000);
+      await applyLink.click({ noWaitAfter: true }).catch(() => applyButton.click({ noWaitAfter: true }));
     } else {
-      const anyApply = applicationTab.locator('a[href*="apply"], button').filter({ hasText: /apply/i }).first();
-      await anyApply.click({ timeout: 5000 }).catch(() => {});
-      await waitForPageReady(applicationTab, 8000);
+      await applicationTab.locator('a[href*="apply"], button').filter({ hasText: /apply/i }).first().click({ timeout: 5000, noWaitAfter: true }).catch(() => {});
+    }
+    const raceResult = await Promise.race([newTabPromise, loadPromise]).catch(() => ({ type: 'load' }));
+    if (raceResult.type === 'newtab') {
+      logStart('New tab opened (external site). Skipping and recording job in sheet with Applied=Yes.');
+      await raceResult.page.close().catch(() => {});
+      await recordSkippedJobInSheet(jobId, current.job);
+      if (applicationTab && !applicationTab.isClosed()) await applicationTab.close().catch(() => {});
+      await takeScreenshot(page, 'external-new-tab', jobId);
+      continue;
     }
 
+    await waitForPageReady(applicationTab, 8000);
     const afterApplyUrl = applicationTab.url();
     if (!isSeekUrl(afterApplyUrl)) {
-      logStart('Redirected to external site after Apply. Closing tab and skipping.');
+      logStart('Redirected to external site after Apply. Skipping and recording job in sheet with Applied=Yes.');
+      await takeScreenshot(applicationTab, 'external-after-apply', jobId);
+      await recordSkippedJobInSheet(jobId, current.job);
       await applicationTab.close().catch(() => {});
-      await takeScreenshot(page, 'external-after-apply', jobId);
-      return;
+      continue;
+    }
+
+    // Check for "visit external site" message (apply goes to employer site instead of upload)
+    const visitExternalVisible = await applicationTab
+      .getByText(/visit\s+external\s+site|external\s+site/i)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (visitExternalVisible) {
+      logStart('Visit external site detected. Skipping and recording job in sheet with Applied=Yes.');
+      await takeScreenshot(applicationTab, 'external-site-message', jobId);
+      await recordSkippedJobInSheet(jobId, current.job);
+      await applicationTab.close().catch(() => {});
+      continue;
     }
 
     await applicationTab.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
@@ -502,11 +752,69 @@ async function main() {
     await coverLetterInput.setInputFiles(pdfPath, { timeout: 5000 });
 
     await new Promise((r) => setTimeout(r, 1000));
-    await takeScreenshot(applicationTab, 'cover-letter-uploaded');
+    await takeScreenshot(applicationTab, 'cover-letter-uploaded', jobId);
 
-    pausedForVerification = true;
-    logStart('Pausing on this page for verification. Close the browser or press Ctrl+C when done.');
-    await new Promise(() => {});
+    await new Promise((r) => setTimeout(r, 500));
+    const { questionCount, firstUnanswered1Based } = await getQuestionFieldStatus(applicationTab);
+
+    if (questionCount > 0 && firstUnanswered1Based > 0) {
+      const note = `application failed because employer question ${firstUnanswered1Based} not answered`;
+      logStart(note);
+      if (useSheet && rowIndex) {
+        try {
+          const sheets = await SheetsManager.fromClientSecret();
+          await sheets.updateJobNotes(rowIndex, note);
+          logStart('Updated Notes column for this job in the spreadsheet.');
+        } catch (e) {
+          logStart('Could not update spreadsheet notes:', e.message);
+        }
+      }
+      await takeScreenshot(applicationTab, 'question-unanswered', jobId);
+      logStart('Skipping to next job (employer question not answered).');
+    } else if (questionCount > 0 && firstUnanswered1Based === 0) {
+      logStart('All employer questions prefilled. Clicking Continue until Review and submit (Submit application) is shown.');
+      await clickContinueUntilReviewSubmitPage(applicationTab, jobId);
+      await clickSubmitApplicationAndMarkInSheet(applicationTab, jobId, current.job);
+      logStart('Application submitted.');
+    } else {
+      const submitBtn = applicationTab.getByRole('button', { name: /submit\s*application/i }).first();
+      const continueBtn = applicationTab.getByRole('button', { name: /continue/i }).first();
+      const submitVisible = await submitBtn.isVisible().catch(() => false);
+      const continueVisible = await continueBtn.isVisible().catch(() => false);
+
+      if (submitVisible) {
+        logStart('Submit application button found. Clicking Submit and marking as applied.');
+        await clickSubmitApplicationAndMarkInSheet(applicationTab, jobId, current.job);
+        logStart('Application submitted.');
+      } else if (continueVisible) {
+        logStart('Continue button found. Clicking Continue until Review and submit (Submit application) is shown.');
+        await clickContinueUntilReviewSubmitPage(applicationTab, jobId);
+        await clickSubmitApplicationAndMarkInSheet(applicationTab, jobId, current.job);
+        logStart('Application submitted.');
+      } else {
+        logStart('Neither Submit application nor Continue button found. Skipping to next job.');
+        await takeScreenshot(applicationTab, 'post-upload-unknown', jobId);
+      }
+    }
+
+      if (applicationTab && !applicationTab.isClosed()) await applicationTab.close().catch(() => {});
+      } catch (jobErr) {
+        logStart(`Job ${jobId} failed: ${jobErr.message || jobErr}`);
+        try {
+          const sheets = await SheetsManager.fromClientSecret();
+          await sheets.addJobForManualApply(jobId, current.job);
+          logStart('Job added to sheet for manual apply later (Applied left unchecked).');
+        } catch (e) {
+          logStart('Could not add job to sheet for manual apply:', e.message);
+        }
+        if (applicationTab && !applicationTab.isClosed()) {
+          await takeScreenshot(applicationTab, 'error-application-tab', jobId).catch(() => {});
+          await applicationTab.close().catch(() => {});
+        }
+      }
+    } // end for (current of jobs)
+
+    logStart(`Finished processing ${jobs.length} job(s).`);
   } catch (err) {
     let errMsg = err.message || String(err);
     if (page && !page.isClosed()) {
@@ -524,7 +832,7 @@ async function main() {
     logStart('Error:', errMsg);
     throw err;
   } finally {
-    if (browser && !pausedForVerification) await browser.close();
+    if (browser) await browser.close();
   }
 }
 

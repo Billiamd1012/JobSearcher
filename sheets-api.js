@@ -16,21 +16,20 @@ const TOKEN_PATH = path.join(__dirname, 'config', 'token.json');
 const JOBS_SHEET_ID = process.env.JOBS_SHEET_ID || '';
 
 /**
- * Jobs sheet columns (A:P): ID, Position name, Company, Want, Posted, Expiry Date,
- * Genre, Type, Location, Link, Applied, Application date, Rejected, Rejected Date, Expired, Expired date.
- * buildJobRow fills only the columns we have; others are left empty.
+ * Jobs sheet columns (A:Q): ID, Position name, Company, Want, Posted, Expiry Date,
+ * Genre, Type, Location, Link, Applied, Application date, Rejected, Rejected Date, Expired, Expired date, Notes.
  */
 const JOBS_SHEET_COLUMNS = [
   'ID', 'Position name', 'Company', 'Want', 'Posted', 'Expiry Date',
   'Genre', 'Type', 'Location', 'Link', 'Applied', 'Application date',
-  'Rejected', 'Rejected Date', 'Expired', 'Expired date',
+  'Rejected', 'Rejected Date', 'Expired', 'Expired date', 'Notes',
 ];
 
 /**
- * Build a row array for the Jobs sheet from a job object. All 16 columns (A:P) are present;
+ * Build a row array for the Jobs sheet from a job object. All 17 columns (A:Q) are present;
  * columns we do not set are empty strings.
  * @param {object} job - { positionName, company?, posted?, expiry?, genre?, type?, location?, link? }
- * @returns {string[]} - Row for A:P
+ * @returns {string[]} - Row for A:Q
  * @throws {Error} if job is null, undefined, or not a plain object
  */
 function buildJobRow(job) {
@@ -65,6 +64,7 @@ function buildJobRow(job) {
     '',             // N: Rejected Date
     '',             // O: Expired
     '',             // P: Expired date
+    '',             // Q: Notes
   ];
 }
 
@@ -168,7 +168,7 @@ class SheetsManager {
       const row = rows[i];
       const link = (row[9] && String(row[9]).trim()) || '';
       const applied = (row[10] && String(row[10]).trim()) || '';
-      if (/^\s*y(es)?|1|true\s*$/i.test(applied)) continue;
+      if (/^(\s*y(es)?|\s*1|\s*true)\s*$/i.test(applied)) continue;
       const idMatch = link.match(/\/job\/(\d+)/);
       if (!idMatch) continue;
       const jobId = idMatch[1];
@@ -184,7 +184,7 @@ class SheetsManager {
   }
 
   /**
-   * Append one job row to the Jobs sheet. Writes all columns A:P; unfilled columns are empty.
+   * Append one job row to the Jobs sheet. Writes all columns A:Q; unfilled columns are empty.
    * @param {object} job - { positionName, company, posted?, expiry?, genre?, type, location, link }
    * @param {string} [spreadsheetId]
    * @param {string} [range] - e.g. 'Sheet1' or 'Jobs'
@@ -195,10 +195,207 @@ class SheetsManager {
     try {
       await this.sheets.spreadsheets.values.append({
         spreadsheetId,
-        range: `${range}!A:P`,
+        range: `${range}!A:Q`,
         valueInputOption: 'USER_ENTERED',
         insertDataOption: 'INSERT_ROWS',
         requestBody: { values },
+      });
+    } catch (err) {
+      const msg = err.message || '';
+      const cause = err.cause || err;
+      const causeMsg = (cause && cause.message) || '';
+      if (
+        err.code === 403 ||
+        msg.includes('insufficient authentication scopes') ||
+        causeMsg.includes('insufficient authentication scopes')
+      ) {
+        throw new Error(
+          'Sheets write failed: token is missing the spreadsheets scope. Run: node scripts/refresh-oauth-token.js then try again.'
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Update the Notes column (Q) for a job row.
+   * @param {number} rowIndex - 1-based row number
+   * @param {string} notes - Text to write (e.g. "application failed because employer question 2 not answered")
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   */
+  async updateJobNotes(rowIndex, notes, spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    const range = `${sheetName}!Q${rowIndex}`;
+    try {
+      await this.sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [[notes]] },
+      });
+    } catch (err) {
+      const msg = err.message || '';
+      const cause = err.cause || err;
+      const causeMsg = (cause && cause.message) || '';
+      if (
+        err.code === 403 ||
+        msg.includes('insufficient authentication scopes') ||
+        causeMsg.includes('insufficient authentication scopes')
+      ) {
+        throw new Error(
+          'Sheets write failed: token is missing the spreadsheets scope. Run: node scripts/refresh-oauth-token.js then try again.'
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Check whether a job is already marked as applied in the sheet (column K).
+   * @param {string} jobId - e.g. '90276720'
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   * @returns {Promise<boolean>} - true if the job exists in the sheet and Applied (K) is Yes/1/true
+   */
+  async isJobApplied(jobId, spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    if (!jobId || !spreadsheetId) return false;
+    const rowIndex = await this.findRowIndexByJobId(jobId, spreadsheetId, sheetName);
+    if (rowIndex == null) return false;
+    const rows = await this.getValues(`${sheetName}!K${rowIndex}:K${rowIndex}`, spreadsheetId);
+    const applied = (rows[0] && rows[0][0] && String(rows[0][0]).trim()) || '';
+    return /^(\s*y(es)?|\s*1|\s*true)\s*$/i.test(applied);
+  }
+
+  /**
+   * Find the 1-based row index of a job by Seek job ID (match column A = jobId or Link column J contains /job/{jobId}).
+   * @param {string} jobId - e.g. '90276720'
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   * @returns {Promise<number|null>} - 1-based row index or null if not found
+   */
+  async findRowIndexByJobId(jobId, spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    if (!jobId || !spreadsheetId) return null;
+    const rows = await this.getValues(`${sheetName}!A:J`, spreadsheetId);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const colA = (row[0] && String(row[0]).trim()) || '';
+      const link = (row[9] && String(row[9]).trim()) || '';
+      if (colA === String(jobId)) return i + 1;
+      const idMatch = link.match(/\/job\/(\d+)/);
+      if (idMatch && idMatch[1] === String(jobId)) return i + 1;
+    }
+    return null;
+  }
+
+  /**
+   * Mark a job as applied: find row by jobId; if found update Applied (K) and Application date (L); if not found append a new row with job data and Applied=Yes.
+   * @param {string} jobId - e.g. '90276720'
+   * @param {object} job - { positionName, company, link?, posted?, type?, location?, ... } for building a new row when appending
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   */
+  async markJobAsAppliedByIdOrAppend(jobId, job, spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    if (!jobId || !spreadsheetId) return;
+    const now = new Date();
+    const day = String(now.getDate()).padStart(2, '0');
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const year = now.getFullYear();
+    const applicationDate = `${day}/${month}/${year}`;
+
+    const rowIndex = await this.findRowIndexByJobId(jobId, spreadsheetId, sheetName);
+    if (rowIndex != null) {
+      await this.markJobAsApplied(rowIndex, spreadsheetId, sheetName);
+      return;
+    }
+    const row = buildJobRow(job);
+    row[0] = String(jobId);
+    row[10] = true;   // Applied: TRUE = checked tickbox (format column K as Checkbox in Sheets)
+    row[11] = applicationDate;
+    try {
+      await this.sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `${sheetName}!A:Q`,
+        valueInputOption: 'USER_ENTERED',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [row] },
+      });
+    } catch (err) {
+      const msg = err.message || '';
+      const cause = err.cause || err;
+      const causeMsg = (cause && cause.message) || '';
+      if (
+        err.code === 403 ||
+        msg.includes('insufficient authentication scopes') ||
+        causeMsg.includes('insufficient authentication scopes')
+      ) {
+        throw new Error(
+          'Sheets write failed: token is missing the spreadsheets scope. Run: node scripts/refresh-oauth-token.js then try again.'
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Add a job to the sheet without marking as applied (e.g. when automation failed so user can manually apply later).
+   * If the job already exists (by jobId), no change. Otherwise appends a new row with job data and Applied (K) left empty.
+   * @param {string} jobId - e.g. '90276720'
+   * @param {object} job - { positionName, company, link?, posted?, type?, location?, ... }
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   */
+  async addJobForManualApply(jobId, job, spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    if (!jobId || !spreadsheetId) return;
+    const rowIndex = await this.findRowIndexByJobId(jobId, spreadsheetId, sheetName);
+    if (rowIndex != null) return; // already in sheet
+    const row = buildJobRow(job);
+    row[0] = String(jobId);
+    // K (Applied) and L (Application date) left empty for manual apply
+    try {
+      await this.sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `${sheetName}!A:Q`,
+        valueInputOption: 'USER_ENTERED',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [row] },
+      });
+    } catch (err) {
+      const msg = err.message || '';
+      const cause = err.cause || err;
+      const causeMsg = (cause && cause.message) || '';
+      if (
+        err.code === 403 ||
+        msg.includes('insufficient authentication scopes') ||
+        causeMsg.includes('insufficient authentication scopes')
+      ) {
+        throw new Error(
+          'Sheets write failed: token is missing the spreadsheets scope. Run: node scripts/refresh-oauth-token.js then try again.'
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Mark a job row as applied: set Applied (K) to TRUE (checkbox tick) and Application date (L) to today (DD/MM/YYYY).
+   * Column K should be formatted as Checkbox in Sheets so TRUE displays as a filled tickbox.
+   * @param {number} rowIndex - 1-based row number
+   * @param {string} [spreadsheetId]
+   * @param {string} [sheetName] - e.g. 'Sheet1'
+   */
+  async markJobAsApplied(rowIndex, spreadsheetId = JOBS_SHEET_ID, sheetName = 'Sheet1') {
+    const now = new Date();
+    const day = String(now.getDate()).padStart(2, '0');
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const year = now.getFullYear();
+    const applicationDate = `${day}/${month}/${year}`;
+    const range = `${sheetName}!K${rowIndex}:L${rowIndex}`;
+    try {
+      await this.sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [[true, applicationDate]] },
       });
     } catch (err) {
       const msg = err.message || '';

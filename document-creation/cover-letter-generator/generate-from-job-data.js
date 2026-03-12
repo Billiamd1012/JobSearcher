@@ -102,10 +102,10 @@ function loadJobData(jobDataPath) {
 async function main() {
   const { jobDataPath, resumePath, outputDir } = parseArgs();
 
-  console.log('Cover letter generator (from job-data)');
-  console.log('Job data path:', jobDataPath);
-  console.log('Output dir:', outputDir);
-  if (resumePath) console.log('Resume path:', resumePath);
+  console.log('[cover letter] Cover letter generator (from job-data)');
+  console.log('[cover letter] Job data path:', jobDataPath);
+  console.log('[cover letter] Output dir:', outputDir);
+  if (resumePath) console.log('[cover letter] Resume path:', resumePath);
 
   const resolvedJobPath = resolvePath(jobDataPath);
   if (!fs.existsSync(resolvedJobPath)) {
@@ -113,19 +113,21 @@ async function main() {
   }
 
   const jobDataEntries = loadJobData(resolvedJobPath);
+  console.log('[cover letter] Loading resume and sample...');
   const resumeText = await loadResume(resumePath);
   const sampleCoverLetter = await loadSampleCoverLetter();
   const resolvedOutputDir = ensureOutputDir(outputDir);
 
-  if (resumeText) console.log('Resume: loaded from', resumePath || DEFAULT_RESUME_DIR);
-  else if (resumePath) console.log('Resume path:', resumePath, '(file not found or empty)');
-  if (sampleCoverLetter) console.log('Sample cover letter: loaded from', DEFAULT_COVERLETTER_DIR);
-  console.log(`Loaded ${jobDataEntries.length} job file(s). Output directory: ${resolvedOutputDir}`);
+  if (resumeText) console.log('[cover letter] Resume: loaded from', resumePath || DEFAULT_RESUME_DIR);
+  else if (resumePath) console.log('[cover letter] Resume path:', resumePath, '(file not found or empty)');
+  if (sampleCoverLetter) console.log('[cover letter] Sample cover letter: loaded from', DEFAULT_COVERLETTER_DIR);
+  console.log(`[cover letter] Loaded ${jobDataEntries.length} job file(s). Output directory: ${resolvedOutputDir}`);
 
+  console.log('[cover letter] Checking Ollama...');
   const { startedByUs } = await ensureOllamaRunning({ spawnIfNeeded: true });
   const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
-  console.log('LLM backend:', startedByUs ? 'Ollama (started by this script)' : 'Ollama (already running)');
-  console.log('Model:', OLLAMA_MODEL);
+  console.log('[cover letter] LLM backend:', startedByUs ? 'Ollama (started by this script)' : 'Ollama (already running)');
+  console.log('[cover letter] Model:', OLLAMA_MODEL);
 
   const applicantDetails = loadApplicantDetails();
   const applicantName =
@@ -148,9 +150,12 @@ async function main() {
   try {
     for (const entry of jobDataEntries) {
       for (const job of entry.jobs) {
+        console.log(`\n[cover letter] Job: ${job.positionName || '(no title)'} at ${job.company || '(no company)'}`);
+        console.log('[cover letter] Building prompt...');
         const prompt = buildPromptFromTemplate(job, context);
-        console.log(`\nGenerating cover letter for: ${job.positionName} at ${job.company} (prompt ${prompt.length} chars)...`);
+        console.log(`[cover letter] Prompt ready (${prompt.length} chars). Calling Ollama (this may take 1-2 minutes)...`);
         const responseText = await callOllamaGenerateWithRetry(prompt);
+        console.log('[cover letter] Ollama response received. Post-processing text...');
         const cleaned = postProcessCoverLetterText(responseText, { applicantName });
         const folderName = getJobId(job, entry.path);
         const jobFolderPath = path.join(resolvedOutputDir, folderName);
@@ -158,6 +163,7 @@ async function main() {
           applicantLastName,
           applicantDob,
         });
+        console.log('[cover letter] Writing .txt, .docx, .pdf to', jobFolderPath, '...');
         const { txtPath, docxPath, pdfPath } = await writeCoverLetterToFolder(jobFolderPath, cleaned, {
           basename: fileBasename,
         });
@@ -170,12 +176,11 @@ async function main() {
           docxPath,
           pdfPath,
         });
-        console.log(`  Folder: ${jobFolderPath}`);
-        console.log(`    ${path.basename(txtPath)}, ${path.basename(docxPath)}, ${path.basename(pdfPath)}`);
+        console.log('[cover letter] Done. Files:', path.basename(txtPath), path.basename(docxPath), path.basename(pdfPath));
       }
     }
 
-    console.log(`\nGenerated ${results.length} cover letter(s).`);
+    console.log(`\n[cover letter] Generated ${results.length} cover letter(s).`);
     results.forEach((r) => console.log('  ', r.outputFolder));
   } finally {
     cleanupOllamaIfStarted();

@@ -56,9 +56,11 @@ const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', 'config', '.env') });
 const { chromium } = require('playwright');
 const { GmailManager } = require('../gmail-api');
+const { isJobAppliedFromCache } = require(path.join(__dirname, '..', 'job-data', 'applied-status-cache.js'));
 
 const SCREENSHOTS_DIR = path.join(__dirname, 'screenshots');
 const JOB_DATA_DIR = path.join(__dirname, '..', 'job-data');
+const KEYWORD_EXCLUDE_PATH = path.join(__dirname, 'keyword-exclude.txt');
 
 // Verbosity (set VERBOSITY=0|1|2 in env): 0 = no logs, 1 = start + errors, 2 = full verbose (default)
 const _verb = parseInt(process.env.VERBOSITY, 10);
@@ -141,6 +143,31 @@ function normalizeWorkType(raw) {
   if (/contract/.test(t)) return 'Contract';
   if (/casual/.test(t)) return 'Casual';
   return '';
+}
+
+/**
+ * Load exclude keywords from job-search/keyword-exclude.txt (one per line; # comments and empty lines ignored).
+ * @returns {string[]}
+ */
+function loadKeywordExclude() {
+  if (!fs.existsSync(KEYWORD_EXCLUDE_PATH)) return [];
+  const text = fs.readFileSync(KEYWORD_EXCLUDE_PATH, 'utf-8');
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.replace(/#.*$/, '').trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * True if the job title contains any of the exclude keywords (case-insensitive).
+ * @param {string} title - Job title
+ * @param {string[]} keywords - Exclude keywords from keyword-exclude.txt
+ * @returns {boolean}
+ */
+function isExcludedByTitle(title, keywords) {
+  if (!title || keywords.length === 0) return false;
+  const lower = title.toLowerCase();
+  return keywords.some((kw) => lower.includes(kw.toLowerCase()));
 }
 
 /**
@@ -528,29 +555,35 @@ async function main() {
       await searchButton.first().click();
     }
 
-    // Wait for search results and scrape all job cards on the first page (total wait ≤ 8s)
+    // Wait for search results (first page)
     logVerbose('Stage: results — waiting for search results URL and first job link');
     await page.waitForURL(/\/job\/|search|jobs-in/, { timeout: 5000 }).catch(() => {});
     const urlAfterSubmit = page.url();
     const isSearchOrJobUrl = /\/job\/|search|jobs-in/.test(urlAfterSubmit);
     expectPage(isSearchOrJobUrl, `URL after submit should be search or job page, got: ${urlAfterSubmit}`);
 
-    // Wait for the first job link to be in the DOM (attached). Seek often keeps the link hidden (e.g. overlay);
-    // we only need it present to read href, so use 'attached' not 'visible'. (5s + 3s = 8s max total above)
     const firstJobLink = page.locator('[data-automation="jobCard"] a[href*="/job/"], article a[href*="/job/"]').first();
     await firstJobLink.waitFor({ state: 'attached', timeout: 3000 });
-    const jobCards = page.locator('[data-automation="jobCard"]').or(
-      page.locator('article').filter({ has: page.locator('a[href*="/job/"]') })
-    );
-    const cardCount = await jobCards.count();
-    expectPage(cardCount > 0, 'at least one job card on search results page');
-    logStart(`Stage: results — scraping ${cardCount} jobs from first page`);
 
     fs.mkdirSync(JOB_DATA_DIR, { recursive: true });
+    const excludeKeywords = loadKeywordExclude();
+    if (excludeKeywords.length > 0) logStart(`Excluding jobs whose title contains any of: ${excludeKeywords.join(', ')}`);
 
-    for (let i = 0; i < cardCount; i++) {
-      const card = jobCards.nth(i);
-      logVerbose(`Stage: job ${i + 1}/${cardCount} — scraping card`);
+    let pageNum = 1;
+    let totalSaved = 0;
+
+    while (true) {
+      const jobCards = page.locator('[data-automation="jobCard"]').or(
+        page.locator('article').filter({ has: page.locator('a[href*="/job/"]') })
+      );
+      const cardCount = await jobCards.count();
+      if (cardCount === 0 && pageNum > 1) break;
+      expectPage(cardCount > 0, `at least one job card on search results page (page ${pageNum})`);
+      logStart(`Stage: results — scraping ${cardCount} jobs from page ${pageNum}`);
+
+      for (let i = 0; i < cardCount; i++) {
+        const card = jobCards.nth(i);
+        logVerbose(`Stage: job ${i + 1}/${cardCount} (page ${pageNum}) — scraping card`);
 
       const CARD_SCRAPE_MS = 3000;
       const linkOverlay = card.locator('[data-automation="job-list-item-link-overlay"]').first();
@@ -591,6 +624,15 @@ async function main() {
         logStart(`Job ${i + 1}/${cardCount} skipped (no link): ${positionName || '(no title)'}`);
         continue;
       }
+      const linkJobIdMatch = link.match(/\/job\/(\d+)/);
+      if (linkJobIdMatch && isJobAppliedFromCache(linkJobIdMatch[1])) {
+        logStart(`Job ${i + 1}/${cardCount} skipped (already applied per cache): ${positionName || '(no title)'}`);
+        continue;
+      }
+      if (isExcludedByTitle(positionName, excludeKeywords)) {
+        logStart(`Job ${i + 1}/${cardCount} skipped (title contains exclude keyword): ${positionName || '(no title)'}`);
+        continue;
+      }
 
       logVerbose('Stage: job details — opening job in new tab via scraped link');
       const jobPage = await context.newPage();
@@ -606,7 +648,7 @@ async function main() {
         await jobPage.waitForLoadState('domcontentloaded').catch(() => {});
         await waitForLCPOrTimeout(jobPage, 2500);
         await jobPage.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-        if (i === 0) {
+        if (pageNum === 1 && i === 0) {
           logVerbose('Stage: two tabs open — saving screenshots two-tabs-search and two-tabs-job');
           await takeScreenshot(page, 'two-tabs-search');
           await takeScreenshot(jobPage, 'two-tabs-job');
@@ -632,13 +674,42 @@ async function main() {
       }
       fs.writeFileSync(jobDataPath, JSON.stringify(job, null, 2), 'utf-8');
       logStart('Job data saved:', jobDataPath);
+      totalSaved += 1;
     }
 
-    logStart(`Scraped ${cardCount} job(s) from first page.`);
+      logStart(`Scraped ${cardCount} job(s) from page ${pageNum}.`);
+
+      // Next page: look for Next link/button at bottom (Seek pagination)
+      const nextLink = page.getByRole('link', { name: /^\s*next\s*$/i }).first();
+      const nextButton = page.getByRole('button', { name: /^\s*next\s*$/i }).first();
+      const nextAria = page.locator('[aria-label*="next" i], [data-automation*="next" i]').first();
+      const hasNextLink = await nextLink.isVisible().catch(() => false);
+      const hasNextButton = await nextButton.isVisible().catch(() => false);
+      const hasNextAria = await nextAria.isVisible().catch(() => false);
+      const nextEl = hasNextLink ? nextLink : (hasNextButton ? nextButton : nextAria);
+      const hasNext = hasNextLink || hasNextButton || hasNextAria;
+      if (!hasNext) {
+        logStart('No next page button; finished scraping all pages.');
+        break;
+      }
+      logStart(`Clicking next page (page ${pageNum + 1})...`);
+      try {
+        await nextEl.click({ timeout: 15000 });
+        await waitForPageReady(page, 3000);
+        await page.waitForURL(/\/job\/|search|jobs-in/, { timeout: 8000 }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 1500));
+        pageNum += 1;
+      } catch (nextErr) {
+        logStart('Next button click failed or timed out (e.g. element covered). Stopping pagination so apply script can run.');
+        logVerbose(nextErr.message || nextErr);
+        break;
+      }
+    }
+
+    logStart(`Scraped all pages. Total jobs saved: ${totalSaved}.`);
     await takeScreenshot(page, 'finished');
 
     logVerbose('Stage: done — pausing then closing browser');
-    // Brief pause before closing so user can see result
     await new Promise((resolve) => setTimeout(resolve, 2000));
   } catch (err) {
     let errMsg = err.message || String(err);
