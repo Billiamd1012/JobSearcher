@@ -21,3 +21,5 @@ document-creation/documents/*
 document-creation/documents/details/applicant-details/
 !document-creation/documents/prompts/
 !document-creation/documents/prompts/cover-letter-default.txt
+
+job-data/*.json

@@ -832,7 +832,11 @@ async function main() {
     logStart('Error:', errMsg);
     throw err;
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      logStart('Finished. Browser left open so you can manually apply to any jobs that errored. Close the window or press Ctrl+C when done.');
+      // Do not close browser on completion — user may want to finish failed jobs manually
+      // await browser.close();
+    }
   }
 }
 
