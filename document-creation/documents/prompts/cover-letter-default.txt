@@ -17,15 +17,27 @@ Applicant context (use only if provided):
 {{coverLetterSection}}
 
 Instructions:
+- CRITICAL: Output a full cover letter in prose only—never an outline, bullet points, or instructions (e.g. "State role...", "Mention..."). Write the actual letter from salutation to sign-off.
 - Address the letter to the hiring team or "Hiring Manager" if no name is given.
 - Open with a short paragraph stating the role and company you are applying to.
-- In two paragraphs, connect your experience fromand motivation to the role and company (use resume/context above if provided).
+- In two paragraphs, connect your experience and motivation to the role and company (use resume/context above if provided).
+- Use clear paragraph structure: put two blank lines (a double line break) between each paragraph (salutation, opening, body paragraphs, closing) so there is a visible gap. Do not run paragraphs together without this gap.
 - Highlights 2–3 relevant skills or achievements from my resume
 - Reflects genuine interest in the company or role
 - Avoids generic or overly formal language
 - Close with a brief sign-off (e.g. "Yours sincerely") followed by the applicant's actual name when provided in Applicant context above; otherwise use [Your full name]. Do not output a placeholder when the applicant name is given.
-- Keep the letter to one page when possible (roughly 250–400 words).
+- Keep the letter to one page when possible (roughly 250–400 words). Write the complete letter from start to finish; do not truncate mid-sentence.
 - Output only the cover letter text, no meta-commentary or markdown.
 - do not make statements like I have attached my portfolio or any other statements that imply I have performed actions you are not able to verify
 
-Cover letter:
+Do any planning, drafts, or double-checks (e.g. checking word count, prose vs outline, paragraph breaks) before the markers. Only after you have finished all such checks, write the single final cover letter once between the markers below. Do not include planning, checklists, drafts, or meta-commentary between the markers—only the final letter from salutation to sign-off.
+
+Between the markers below you MUST write the complete letter in full prose only: real sentences and paragraphs that a hiring manager would read. Do NOT write an outline, bullet points, or instructions (e.g. "State role...", "Mention...", "Connect...", "Reiterate...")—write the actual cover letter text. An outline or list of points is not acceptable; output the full letter only.
+
+You MUST wrap the final cover letter in the following markers so it can be extracted (put nothing else between the markers except the letter text):
+Wrap with <<<<<<COVER_LETTER_START>>> and <<<COVER_LETTER_END>>>
+
+Example:
+<<<COVER_LETTER_START>>>
+(Your cover letter from salutation to sign-off goes here, and only here—no checklists, no drafts, no commentary.)
+<<<COVER_LETTER_END>>>
