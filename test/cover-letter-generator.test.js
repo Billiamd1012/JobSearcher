@@ -4,11 +4,13 @@
  * Uses document-creation/cover-letter-generator (index.js).
  *
  * Prompt tests are unit tests. Ollama generate tests mock http.request (no live Ollama needed).
+ * Remote-Ollama tests mock both http and https so that remote OLLAMA_BASE_URL still produces output.
  */
 
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert');
 const http = require('http');
+const https = require('https');
 
 const fs = require('fs');
 const path = require('path');
@@ -29,12 +31,17 @@ const {
   wrapLineForPdf,
   textToPdfBuffer,
   getApplicantLastName,
+  getJobId,
+  generateCoverLetterBasename,
   cleanupOllamaIfStarted,
   stripAiMessageFromCoverLetterText,
   buildCoverLetterDocxParagraphs,
   AI_COVER_LETTER_MESSAGE,
   DEFAULT_OUTPUT_DIR,
   COVERLETTER_BASENAME,
+  parseOllamaGenerateResponse,
+  extractWrappedLetter,
+  looksLikeOutlineLetter,
 } = require('../document-creation/cover-letter-generator/index.js');
 
 // ---------- Step 3: Prompt construction ----------
@@ -371,6 +378,236 @@ describe('callOllamaGenerate (step 4)', () => {
   });
 });
 
+describe('extractWrappedLetter and parseOllamaGenerateResponse (wrapped markers)', () => {
+  const letter = 'Dear Hiring Manager,\n\nI am writing to apply for the role.\n\nYours sincerely,\nJane Doe';
+
+  it('extractWrappedLetter returns content between <<<COVER_LETTER_START>>> and <<<COVER_LETTER_END>>>', () => {
+    const wrapped = `Some planning here.\n<<<COVER_LETTER_START>>>\n${letter}\n<<<COVER_LETTER_END>>>\nMore text.`;
+    assert.strictEqual(extractWrappedLetter(wrapped), letter);
+  });
+
+  it('extractWrappedLetter is case-insensitive for markers', () => {
+    const wrapped = `<<<cover_letter_start>>>\n${letter}\n<<<cover_letter_end>>>`;
+    assert.strictEqual(extractWrappedLetter(wrapped), letter);
+  });
+
+  it('extractWrappedLetter returns empty string when markers absent', () => {
+    assert.strictEqual(extractWrappedLetter(letter), '');
+    assert.strictEqual(extractWrappedLetter(''), '');
+  });
+
+  it('parseOllamaGenerateResponse returns only wrapped content when response contains markers', () => {
+    const body = JSON.stringify({
+      response: `Outline here.\n<<<COVER_LETTER_START>>>\n${letter}\n<<<COVER_LETTER_END>>>`,
+      done: true,
+    });
+    const out = parseOllamaGenerateResponse(body);
+    assert.strictEqual(out, letter);
+  });
+
+  it('parseOllamaGenerateResponse returns only wrapped content when thinking contains markers', () => {
+    const body = JSON.stringify({
+      response: '',
+      thinking: `*   **Header:** ...\n*   **Opening:** ...\n<<<COVER_LETTER_START>>>\n${letter}\n<<<COVER_LETTER_END>>>`,
+      done: true,
+    });
+    const out = parseOllamaGenerateResponse(body);
+    assert.strictEqual(out, letter);
+  });
+
+  it('buildPromptFromTemplate includes wrapper instruction (markers in prompt)', () => {
+    const prompt = buildPromptFromTemplate(
+      { company: 'Acme', positionName: 'Engineer', description: 'Build things.' },
+      { applicantName: 'Jane' }
+    );
+    assert.ok(prompt.includes('<<<COVER_LETTER_START>>>'), 'prompt should instruct wrapping with start marker');
+    assert.ok(prompt.includes('<<<COVER_LETTER_END>>>'), 'prompt should instruct wrapping with end marker');
+  });
+
+  it('parseOllamaGenerateResponse returns extracted letter when thinking contains outline-style content (outline is used as fallback)', () => {
+    const outlineThinking = [
+      'Thinking:',
+      '**Salutation:** Dear Hiring Manager,',
+      '**Opening:** State role (Azure Engineer) and company (Green Light PS Pty Ltd). Mention interest.',
+      '**Body 1:** Connect IT degree to Azure. Mention scripting.',
+      '**Closing:** Reiterate enthusiasm.',
+      'Yours sincerely, William Darker.',
+    ].join('\n');
+    const body = JSON.stringify({ response: '', thinking: outlineThinking, done: true });
+    const out = parseOllamaGenerateResponse(body);
+    assert.ok(out.length > 0, 'should return extracted content (outline fallback)');
+    assert.ok(/Dear\s+Hiring\s+Manager/i.test(out), 'should start with salutation');
+    assert.ok(/Yours sincerely/i.test(out), 'should include sign-off');
+    assert.ok(looksLikeOutlineLetter(out), 'extracted outline should be detected by looksLikeOutlineLetter');
+  });
+
+  it('looksLikeOutlineLetter returns true for outline-style text, false for prose', () => {
+    const outline = 'Dear Hiring Manager,\nState role (Azure Engineer) and company. Mention interest.\nConnect X to Y.\nYours sincerely, Jane.';
+    const prose = 'Dear Hiring Manager,\n\nI am writing to apply for the Azure Engineer role at Green Light PS Pty Ltd.\n\nYours sincerely,\nJane Doe.';
+    assert.strictEqual(looksLikeOutlineLetter(outline), true);
+    assert.strictEqual(looksLikeOutlineLetter(prose), false);
+  });
+});
+
+// ---------- Remote Ollama (https): ensure we get output when using remote hosted model ----------
+
+describe('remote Ollama (HTTPS) produces output', () => {
+  const REMOTE_URL = 'https://ollama.remote.example.com';
+  const indexPath = path.join(__dirname, '..', 'document-creation', 'cover-letter-generator', 'index.js');
+  const indexResolved = require.resolve(indexPath);
+
+  function mockBothProtocols(generateResponseText) {
+    const body = { response: generateResponseText, done: true };
+    const restoreHttp = http.request;
+    const restoreHttps = https.request;
+
+    function createMockRequest() {
+      return function (opts, responseCallback) {
+        const isGenerate = opts.method === 'POST' && (opts.path === '/api/generate' || (opts.pathname && opts.pathname.includes && opts.pathname.includes('/api/generate')));
+        const pathStr = opts.path || opts.pathname || '';
+        const isGeneratePath = pathStr.includes('/api/generate');
+        const statusCode = isGeneratePath && opts.method === 'POST' ? 200 : 200;
+        const mockRes = {
+          statusCode,
+          _dataListener: null,
+          _endListener: null,
+          on(ev, fn) {
+            if (ev === 'data') this._dataListener = fn;
+            if (ev === 'end') this._endListener = fn;
+            return this;
+          },
+        };
+        const mockReq = {
+          write: () => {},
+          end: () => {
+            setImmediate(() => {
+              if (mockRes._dataListener && isGeneratePath && opts.method === 'POST') {
+                mockRes._dataListener(Buffer.from(JSON.stringify(body)));
+              }
+              if (mockRes._endListener) mockRes._endListener();
+            });
+          },
+          on: () => mockReq,
+        };
+        setImmediate(() => responseCallback(mockRes));
+        return mockReq;
+      };
+    }
+
+    http.request = createMockRequest('http');
+    https.request = createMockRequest('https');
+
+    return () => {
+      http.request = restoreHttp;
+      https.request = restoreHttps;
+    };
+  }
+
+  it('ensureOllamaRunning does not spawn and callOllamaGenerate returns output when OLLAMA_BASE_URL is remote https', async () => {
+    const savedEnv = process.env.OLLAMA_BASE_URL;
+    process.env.OLLAMA_BASE_URL = REMOTE_URL;
+    delete require.cache[indexResolved];
+    const remoteIndex = require(indexPath);
+    const restoreMocks = mockBothProtocols('Dear Hiring Manager,\n\nI am writing to apply via the remote model.\n\nYours sincerely,\n[Your full name]');
+
+    try {
+      const { startedByUs } = await remoteIndex.ensureOllamaRunning({ spawnIfNeeded: true });
+      assert.strictEqual(startedByUs, false, 'should not start local Ollama when remote URL is used');
+
+      const text = await remoteIndex.callOllamaGenerate('test prompt');
+      assert.ok(text.length > 0, 'remote generate must return non-empty output');
+      assert.ok(text.includes('remote model'), text);
+    } finally {
+      restoreMocks();
+      if (savedEnv !== undefined) process.env.OLLAMA_BASE_URL = savedEnv;
+      else delete process.env.OLLAMA_BASE_URL;
+      delete require.cache[indexResolved];
+      require(indexPath); // re-load default so later tests see localhost again
+    }
+  });
+
+  it('callOllamaGenerate with remote http URL returns output when https mock is not used (http path)', async () => {
+    const savedEnv = process.env.OLLAMA_BASE_URL;
+    process.env.OLLAMA_BASE_URL = 'http://remote.example.com';
+    delete require.cache[indexResolved];
+    const remoteIndex = require(indexPath);
+    const restoreMocks = mockBothProtocols('Output from remote http host.');
+
+    try {
+      const text = await remoteIndex.callOllamaGenerate('test');
+      assert.strictEqual(text, 'Output from remote http host.');
+    } finally {
+      restoreMocks();
+      if (savedEnv !== undefined) process.env.OLLAMA_BASE_URL = savedEnv;
+      else delete process.env.OLLAMA_BASE_URL;
+      delete require.cache[indexResolved];
+      require(indexPath);
+    }
+  });
+
+  it('full pipeline with mocked Ollama (NDJSON) produces .txt with non-zero bytes', async () => {
+    const ndjsonBody =
+      JSON.stringify({ response: 'Dear Hiring Manager,\n\n', done: false }) +
+      '\n' +
+      JSON.stringify({ response: 'I am writing to apply for the role at Acme Corp.\n\nYours sincerely,\n', done: false }) +
+      '\n' +
+      JSON.stringify({ response: 'Jane Doe', done: true });
+    const restoreHttp = http.request;
+    const restoreHttps = https.request;
+    http.request = function (opts, responseCallback) {
+      const pathStr = opts.path || opts.pathname || '';
+      const isGenerate = opts.method === 'POST' && pathStr.includes('/api/generate');
+      const mockRes = {
+        statusCode: 200,
+        _dataListener: null,
+        _endListener: null,
+        on(ev, fn) {
+          if (ev === 'data') this._dataListener = fn;
+          if (ev === 'end') this._endListener = fn;
+          return this;
+        },
+      };
+      const mockReq = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            if (mockRes._dataListener && isGenerate) mockRes._dataListener(Buffer.from(ndjsonBody));
+            if (mockRes._endListener) mockRes._endListener();
+          });
+        },
+        on: () => mockReq,
+      };
+      setImmediate(() => responseCallback(mockRes));
+      return mockReq;
+    };
+    https.request = http.request;
+
+    try {
+      const job = { company: 'Acme Corp', positionName: 'Engineer', description: 'Build things.' };
+      const prompt = buildPromptFromTemplate(job, { applicantName: 'Jane Doe' });
+      const responseText = await callOllamaGenerateWithRetry(prompt);
+      assert.ok(responseText.length > 0, 'Ollama must return non-empty text');
+      const cleaned = postProcessCoverLetterText(responseText, { applicantName: 'Jane Doe' });
+      const outputDir = path.join(os.tmpdir(), `cover-letter-nonzero-test-${Date.now()}`);
+      const jobFolderPath = path.join(outputDir, getJobId(job));
+      const basename = generateCoverLetterBasename(job, { applicantLastName: 'Doe' });
+      const { txtPath } = await writeCoverLetterToFolder(jobFolderPath, cleaned, { basename });
+      const stat = fs.statSync(txtPath);
+      assert.ok(stat.size > 0, 'cover letter .txt file must not be zero bytes');
+      const content = fs.readFileSync(txtPath, 'utf-8');
+      assert.ok(content.trim().length > 0, 'cover letter .txt content must be non-empty');
+      try {
+        fs.rmSync(outputDir, { recursive: true });
+      } catch {
+        // ignore
+      }
+    } finally {
+      http.request = restoreHttp;
+      https.request = restoreHttps;
+    }
+  });
+});
+
 // ---------- Step 5: Post-process and save ----------
 
 describe('postProcessCoverLetterText (step 5)', () => {
@@ -387,10 +624,11 @@ describe('postProcessCoverLetterText (step 5)', () => {
     );
   });
 
-  it('collapses 3+ newlines to 2', () => {
-    const raw = 'Para one.\n\n\n\nPara two.';
-    assert.ok(postProcessCoverLetterText(raw).includes('\n\n'));
-    assert.ok(!postProcessCoverLetterText(raw).includes('\n\n\n'));
+  it('collapses 4+ newlines to 3 (preserves double paragraph gap)', () => {
+    const raw = 'Para one.\n\n\n\n\nPara two.';
+    const out = postProcessCoverLetterText(raw);
+    assert.ok(out.includes('\n\n\n'), 'should preserve 3 newlines (double gap)');
+    assert.ok(!out.includes('\n\n\n\n'), 'should collapse 4+ newlines to 3');
   });
 
   it('ensures output ends with single newline', () => {
@@ -513,6 +751,15 @@ describe('writeCoverLetterToFolder (step 5)', () => {
     assert.ok(path.basename(pdfPath).startsWith(COVERLETTER_BASENAME));
     const pdfBuf = fs.readFileSync(pdfPath);
     assert.ok(Buffer.isBuffer(pdfBuf) && pdfBuf.length > 100);
+  });
+
+  it('written .txt file has non-zero size and non-empty content', async () => {
+    const text = 'Dear Hiring Manager,\n\nI am writing to apply for the Software Engineer role at Acme Corp.\n\nYours sincerely,\nJane Doe';
+    const { txtPath } = await writeCoverLetterToFolder(jobFolder, text);
+    const stat = fs.statSync(txtPath);
+    assert.ok(stat.size > 0, 'cover letter .txt file must not be zero bytes');
+    const content = fs.readFileSync(txtPath, 'utf-8');
+    assert.ok(content.trim().length > 0, 'cover letter .txt content must be non-empty');
   });
 });
 

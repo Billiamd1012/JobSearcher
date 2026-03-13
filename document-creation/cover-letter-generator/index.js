@@ -13,6 +13,7 @@
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const https = require('https');
 const { spawn } = require('child_process');
 const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
@@ -46,12 +47,24 @@ Applicant context (use only if provided):
 {{coverLetterSection}}
 
 Instructions:
+- CRITICAL: Output a full cover letter in prose only—never an outline, bullet points, or instructions (e.g. "State role...", "Mention..."). Write the actual letter from salutation to sign-off.
 - Address the letter to the hiring team or "Hiring Manager" if no name is given.
 - Open with a short paragraph stating the role and company you are applying to.
 - In one or two paragraphs, connect your experience and motivation to the role and company (use resume/context above if provided).
+- Use clear paragraph structure: put two blank lines (a double line break) between each paragraph (salutation, opening, body paragraphs, closing) so there is a visible gap. Do not run paragraphs together without this gap.
 - Close with a brief sign-off (e.g. "Yours sincerely") followed by a placeholder for the applicant's name: [Your full name] or the applicant name if provided.
-- Keep the letter to one page when possible (roughly 250–400 words).
+- Keep the letter to one page when possible (roughly 250–400 words). Write the complete letter from start to finish; do not truncate mid-sentence.
 - Output only the cover letter text, no meta-commentary or markdown.
+
+Do any planning, drafts, or double-checks (e.g. checking word count, prose vs outline, paragraph breaks) before the markers. Only after you have finished all such checks, write the single final cover letter once between the markers below. Do not include planning, checklists, drafts, or meta-commentary between the markers—only the final letter from salutation to sign-off.
+
+Between the markers below you MUST write the complete letter in full prose only: real sentences and paragraphs that a hiring manager would read. Do NOT write an outline, bullet points, or instructions (e.g. "State role...", "Mention...", "Connect...", "Reiterate...")—write the actual cover letter text. An outline or list of points is not acceptable; output the full letter only.
+
+You MUST wrap the final cover letter in the following markers so it can be extracted (put nothing else between the markers except the letter text):
+
+<<<COVER_LETTER_START>>>
+(Your cover letter from salutation to sign-off goes here, and only here—no checklists, no drafts, no commentary.)
+<<<COVER_LETTER_END>>>
 
 Cover letter:
 `;
@@ -69,7 +82,7 @@ const OLLAMA_READY_TIMEOUT_MS = 60000;
 const OLLAMA_POLL_MS = 500;
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
 const OLLAMA_GENERATE_TIMEOUT_MS = 120000;
-const OLLAMA_MAX_TOKENS = 1024;
+const OLLAMA_MAX_TOKENS = 6096;
 const OLLAMA_TEMPERATURE = 0.7;
 const OLLAMA_STOP = ['\n\n\n', '---']; // stop on triple newline or markdown divider
 const COVER_LETTER_OUTPUT_FORMAT = (process.env.COVER_LETTER_OUTPUT_FORMAT || 'docx').toLowerCase(); // 'txt' | 'docx'
@@ -98,7 +111,7 @@ function stripAiMessageFromCoverLetterText(text) {
   for (const re of patterns) {
     out = out.replace(re, '\n');
   }
-  out = out.replace(/\n{3,}/g, '\n\n').trimEnd();
+  out = out.replace(/\n{4,}/g, '\n\n\n').trimEnd();
   return out + (out ? '\n' : '');
 }
 
@@ -271,10 +284,12 @@ function ensureOutputDir(outputDir) {
 function isOllamaRunning() {
   return new Promise((resolve) => {
     const url = new URL(OLLAMA_BASE_URL);
-    const req = http.request(
+    const protocol = url.protocol === 'https:' ? https : http;
+    const port = url.port || (url.protocol === 'https:' ? 443 : 80);
+    const req = protocol.request(
       {
         hostname: url.hostname,
-        port: url.port || 80,
+        port,
         path: url.pathname || '/',
         method: 'GET',
         timeout: 3000,
@@ -349,15 +364,32 @@ function waitForOllamaReady(timeoutMs = OLLAMA_READY_TIMEOUT_MS) {
 }
 
 /**
- * Ensure Ollama is running: check first; if not, spawn and wait for ready.
+ * Ensure Ollama is running: check first; if not, spawn and wait for ready (local only).
+ * When OLLAMA_BASE_URL points to a remote host, only check reachability; never spawn.
  * @param {{ spawnIfNeeded?: boolean }} [options]
  * @returns {Promise<{ startedByUs: boolean }>}
  */
+function isLocalOllamaHost() {
+  try {
+    const url = new URL(OLLAMA_BASE_URL);
+    const host = (url.hostname || '').toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  } catch {
+    return true; // treat invalid URL as local for backward compatibility
+  }
+}
+
 async function ensureOllamaRunning(options = {}) {
   const spawnIfNeeded = options.spawnIfNeeded !== false;
 
   if (await isOllamaRunning()) {
     return { startedByUs: false };
+  }
+
+  if (!isLocalOllamaHost()) {
+    throw new Error(
+      `Ollama is not reachable at ${OLLAMA_BASE_URL}. Check the host and network.`
+    );
   }
 
   if (!spawnIfNeeded) {
@@ -423,6 +455,248 @@ function buildPromptFromTemplate(job, context = {}) {
 
 // ---------- Step 4: Call local LLM (Ollama) ----------
 
+/** Markers requested in the prompt so we can regex-extract the final letter from thinking or mixed output. */
+const COVER_LETTER_BEGIN_MARKER = '<<<COVER_LETTER_START>>>';
+const COVER_LETTER_END_MARKER = '<<<COVER_LETTER_END>>>';
+
+/** Minimum length for wrapped content to be treated as a real letter (avoid placeholder like "` and `"). */
+const MIN_WRAPPED_LETTER_LENGTH = 80;
+
+/**
+ * Extract cover letter text between the requested markers. Use this first so thinking-model
+ * output that wraps the final letter is used instead of outline/planning.
+ * When multiple marker pairs exist (e.g. model outputs a placeholder then the full letter),
+ * returns the block with the longest content so we get the actual letter.
+ * @param {string} text - Full response or thinking text
+ * @returns {string} Content between the markers (trimmed), or '' if not found
+ */
+function extractWrappedLetter(text) {
+  if (!text || !text.trim()) return '';
+  const re = new RegExp(
+    COVER_LETTER_BEGIN_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+      '\\s*([\\s\\S]*?)\\s*' +
+      COVER_LETTER_END_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    'gi'
+  );
+  let best = '';
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const inner = m[1] != null ? m[1].trim() : '';
+    if (inner.length > best.length) best = inner;
+  }
+  return best;
+}
+
+/**
+ * Trim cover letter text at the sign-off line (e.g. "Yours sincerely,") plus the next line (name).
+ * Stops inclusion of post-letter thinking/review that models sometimes append.
+ * @param {string} text - Full extracted letter (may include trailing meta)
+ * @returns {string} Text ending at sign-off + name, or original if no sign-off found
+ */
+function trimAtSignOff(text) {
+  if (!text || !text.trim()) return text;
+  const lines = text.split(/\r?\n/);
+  let endIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*Yours sincerely,?\s*$/i.test(lines[i]) || /^\s*(Kind regards|Best regards|Sincerely),?\s*$/i.test(lines[i])) {
+      endIndex = i + 1;
+      break;
+    }
+    if (/^\s*Yours sincerely,?\s+.+$/i.test(lines[i]) || /^\s*(Kind regards|Best regards|Sincerely),?\s+.+$/i.test(lines[i])) {
+      endIndex = i;
+      break;
+    }
+  }
+  if (endIndex < 0) return text;
+  const kept = lines.slice(0, endIndex + 1).join('\n').trimEnd();
+  return kept ? kept + '\n' : '';
+}
+
+/**
+ * Extract only the cover letter body from thinking-model output (e.g. qwen3.5).
+ * Drops "Thinking Process" and planning; keeps content from salutation (e.g. "Dear Hiring Manager")
+ * to the end, and strips "*Label:*" prefixes so the result is plain letter text.
+ * Returns '' when no letter-like section is found, so we never dump raw thinking into the output.
+ * @param {string} thinkingText - Full thinking field content
+ * @returns {string} Extracted letter text (trimmed), or '' if no letter section found
+ */
+function extractLetterFromThinking(thinkingText) {
+  if (!thinkingText || !thinkingText.trim()) return '';
+  const lines = thinkingText.split(/\r?\n/);
+  let draftSectionStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/Drafting\s*[-–]\s*Section by Section/i.test(lines[i]) || /\*\*Drafting(\s+the\s+Text|\s+Content)?\*\*:?\s*$/i.test(lines[i])) {
+      draftSectionStart = i + 1;
+    }
+  }
+  let startIndex = -1;
+  const searchStart = draftSectionStart >= 0 ? draftSectionStart : 0;
+  for (let i = searchStart; i < lines.length; i++) {
+    const line = lines[i];
+    if (/Dear\s+(Hiring Manager|Hiring Team|Sir|Madam|Recruitment)/i.test(line) || /^\s*\*{1,2}Salutation\*{1,2}\s*:\s*/i.test(line)) {
+      const nextLine = (lines[i + 1] || '').trim();
+      const looksLikeProse = /^I am writing|^I wish to apply|^I am excited|^I am writing to express/i.test(nextLine);
+      const looksLikeOutline = /^(State|Focus|Mention|Connect|Express|Apply)\s+/i.test(nextLine);
+      if (draftSectionStart >= 0) {
+        startIndex = i;
+        break;
+      }
+      if (looksLikeProse) {
+        startIndex = i;
+        break;
+      }
+      if (!looksLikeOutline && startIndex < 0) startIndex = i;
+    }
+  }
+  if (startIndex < 0) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/Dear\s+(Hiring Manager|Hiring Team|Sir|Madam|Recruitment)/i.test(lines[i]) || /^\s*\*{1,2}Salutation\*{1,2}\s*:\s*/i.test(lines[i])) {
+        startIndex = i;
+        break;
+      }
+      if (/Drafting\s*[-–]\s*Section by Section/i.test(lines[i])) {
+        startIndex = i + 1;
+        break;
+      }
+    }
+  }
+  if (startIndex < 0) {
+    return '';
+  }
+  const fromLetter = lines.slice(startIndex).join('\n');
+  // Strip list bullets and *Label*: or *Label:* or **Label:** prefixes (e.g. "    *   *Salutation:* " or "*Opening:* " or "**Header:**" or "**Salutation:**")
+  let withoutLabels = fromLetter
+    .replace(/^\s*\*\s*\*[^*]+:\*?\s*/gm, '')
+    .replace(/^\s*\*{1,2}\s*\*{1,2}[^*]+\*{1,2}\s*:?\s*/gm, '')
+    .replace(/^\s*\*\*[^*]+?\*\*:?\s*/gm, '')
+    .replace(/\n\s*\*\s*\*[^*]+:\*?\s*/g, '\n')
+    .replace(/\n\s*\*{1,2}\s*\*{1,2}[^*]+\*{1,2}\s*:?\s*/g, '\n')
+    .replace(/\n\s*\*\*[^*]+?\*\*:?\s*/g, '\n')
+    .replace(/\n\s*\*\s+/g, '\n')
+    .trim();
+  // If result still doesn't start with "Dear", letter may be under **Header:** etc.; find the salutation line
+  if (!/^\s*Dear\s+/i.test(withoutLabels)) {
+    const letterLines = withoutLabels.split(/\r?\n/);
+    const dearIndex = letterLines.findIndex((l) => /Dear\s+(Hiring Manager|Hiring Team|Sir|Madam|Recruitment)/i.test(l));
+    if (dearIndex >= 0) {
+      const fromDear = letterLines.slice(dearIndex).join('\n');
+      withoutLabels = fromDear
+        .replace(/^\s*\*\s*\*[^*]+:\*?\s*/gm, '')
+        .replace(/^\s*\*{1,2}\s*\*{1,2}[^*]+\*{1,2}\s*:?\s*/gm, '')
+        .replace(/^\s*\*\*[^*]+?\*\*:?\s*/gm, '')
+        .replace(/\n\s*\*\s*\*[^*]+:\*?\s*/g, '\n')
+        .replace(/\n\s*\*{1,2}\s*\*{1,2}[^*]+\*{1,2}\s*:?\s*/g, '\n')
+        .replace(/\n\s*\*\*[^*]+?\*\*:?\s*/g, '\n')
+        .replace(/\n\s*\*\s+/g, '\n')
+        .trim();
+    }
+    // If still no "Dear" at start but "Dear" appears somewhere, slice from there (leftover bullets/labels)
+    if (!/^\s*Dear\s+/i.test(withoutLabels) && /Dear\s+(Hiring Manager|Hiring Team|Sir|Madam|Recruitment)/i.test(withoutLabels)) {
+      const idx = withoutLabels.search(/Dear\s+(Hiring Manager|Hiring Team|Sir|Madam|Recruitment)/i);
+      if (idx >= 0) withoutLabels = withoutLabels.slice(idx).trim();
+    }
+  }
+  const result = withoutLabels.replace(/\n{4,}/g, '\n\n\n').trimEnd() + (withoutLabels ? '\n' : '');
+  if (result.length < MIN_WRAPPED_LETTER_LENGTH || !/^\s*Dear\s+/i.test(result)) {
+    return '';
+  }
+  const trimmedAtSignOff = trimAtSignOff(result);
+  return trimmedAtSignOff;
+}
+
+/**
+ * Returns true if the extracted text looks like an outline (instructions/bullets) rather than a full prose letter.
+ * Used to trigger a retry when the model returns outline-style content.
+ * @param {string} text - Extracted cover letter text (after postProcess)
+ * @returns {boolean}
+ */
+function looksLikeOutlineLetter(text) {
+  if (!text || !text.trim()) return false;
+  const afterDear = text.replace(/^\s*Dear\s+[^\n]+\n+/i, '').trim();
+  const firstLine = (afterDear.split(/\n/)[0] || '').trim();
+  const outlineVerb = /^(State|Focus|Mention|Connect|Reiterate|Apply|Express|Acknowledge)\s+/i;
+  if (outlineVerb.test(firstLine)) return true;
+  // Also treat as outline if multiple lines start with these verbs (bullet-style body)
+  const lines = afterDear.split(/\n/).slice(0, 8);
+  const outlineCount = lines.filter((l) => outlineVerb.test(l.trim())).length;
+  return outlineCount >= 2;
+}
+
+/**
+ * Parse Ollama /api/generate response body. Supports both single JSON (stream: false)
+ * and NDJSON (streaming) when the server ignores stream: false (e.g. some remotes/proxies).
+ * For "thinking" models (e.g. qwen3.5:9b), uses the "thinking" field when "response" is empty.
+ * @param {string} raw - Raw response body
+ * @returns {string} Extracted response text (trimmed)
+ * @throws {Error} When body is non-empty but not valid JSON/NDJSON
+ */
+function parseOllamaGenerateResponse(raw) {
+  const trimmed = (raw && raw.trim()) || '';
+  if (!trimmed) return '';
+
+  // Single JSON (stream: false)
+  try {
+    const single = JSON.parse(trimmed);
+    if (single && single.response != null && single.done === true) {
+      const text = String(single.response).trim();
+      if (text) {
+        const wrapped = extractWrappedLetter(text);
+        return (wrapped !== '' && wrapped.length >= MIN_WRAPPED_LETTER_LENGTH) ? wrapped : text;
+      }
+    }
+    // Thinking models: response may be empty while content is in "thinking"
+    if (single && (single.response === '' || (single.response != null && !String(single.response).trim())) && single.thinking != null) {
+      const thinkingText = String(single.thinking).trim();
+      if (thinkingText) {
+        const wrapped = extractWrappedLetter(thinkingText);
+        const useWrapped = wrapped.length >= MIN_WRAPPED_LETTER_LENGTH;
+        if (wrapped !== '' && useWrapped) return wrapped;
+        return extractLetterFromThinking(thinkingText);
+      }
+    }
+  } catch (_) {}
+
+  // NDJSON: server streamed despite stream: false (e.g. remote/proxy)
+  const parts = [];
+  const thinkingParts = [];
+  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj && obj.response != null) {
+        const r = String(obj.response).trim();
+        if (r) parts.push(r);
+      }
+      if (obj && obj.thinking != null) {
+        const t = String(obj.thinking).trim();
+        if (t) thinkingParts.push(t);
+      }
+      if (obj && obj.done === true) break;
+    } catch (_) {}
+  }
+  const ndjsonText = parts.join('').trim();
+  if (ndjsonText) {
+    const wrapped = extractWrappedLetter(ndjsonText);
+    return (wrapped !== '' && wrapped.length >= MIN_WRAPPED_LETTER_LENGTH) ? wrapped : ndjsonText;
+  }
+  // NDJSON with only thinking (no response): extract letter from concatenated thinking
+  const thinkingText = thinkingParts.join('').trim();
+  if (thinkingText) {
+    const wrapped = extractWrappedLetter(thinkingText);
+    const useWrapped = wrapped.length >= MIN_WRAPPED_LETTER_LENGTH;
+    if (wrapped !== '' && useWrapped) return wrapped;
+    return extractLetterFromThinking(thinkingText);
+  }
+
+  // Non-empty body but no valid JSON content
+  try {
+    JSON.parse(trimmed);
+  } catch (e) {
+    throw new Error(`Ollama returned invalid JSON: ${e.message}`);
+  }
+  return '';
+}
+
 /**
  * Call Ollama /api/generate with the given prompt. Returns full response text.
  * @param {string} prompt - Full prompt string (template already filled).
@@ -431,6 +705,7 @@ function buildPromptFromTemplate(job, context = {}) {
  */
 function callOllamaGenerate(prompt, opts = {}) {
   const url = new URL(OLLAMA_BASE_URL);
+  const protocol = url.protocol === 'https:' ? https : http;
   const model = opts.model ?? OLLAMA_MODEL;
   const body = JSON.stringify({
     model,
@@ -444,7 +719,7 @@ function callOllamaGenerate(prompt, opts = {}) {
   });
 
   return new Promise((resolve, reject) => {
-    const req = http.request(
+    const req = protocol.request(
       {
         hostname: url.hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -470,8 +745,7 @@ function callOllamaGenerate(prompt, opts = {}) {
             return;
           }
           try {
-            const data = JSON.parse(raw);
-            const text = data.response != null ? String(data.response).trim() : '';
+            const text = parseOllamaGenerateResponse(raw);
             resolve(text);
           } catch (e) {
             reject(new Error(`Ollama returned invalid JSON: ${e.message}`));
@@ -570,8 +844,8 @@ function postProcessCoverLetterText(raw, opts = {}) {
   const codeFence = /^```\w*\n?([\s\S]*?)```\s*$/m;
   const match = text.match(codeFence);
   if (match) text = match[1].trim();
-  // Collapse 3+ newlines to 2
-  text = text.replace(/\n{3,}/g, '\n\n');
+  // Collapse 4+ newlines to 3 (preserve double line break / two blank lines between paragraphs)
+  text = text.replace(/\n{4,}/g, '\n\n\n');
   text = replaceNamePlaceholders(text, opts.applicantName);
   return text.trimEnd() + (text ? '\n' : '');
 }
@@ -845,4 +1119,7 @@ module.exports = {
   DEFAULT_APPLICANT_DETAILS_DIR,
   SUPPORTED_DOC_EXTENSIONS,
   COVERLETTER_BASENAME,
+  parseOllamaGenerateResponse,
+  extractWrappedLetter,
+  looksLikeOutlineLetter,
 };

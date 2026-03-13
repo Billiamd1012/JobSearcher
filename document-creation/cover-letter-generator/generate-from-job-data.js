@@ -15,6 +15,7 @@ const path = require('path');
 const fs = require('fs');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+require('dotenv').config({ path: path.join(PROJECT_ROOT, 'config', '.env') });
 const DEFAULT_JOB_DATA = path.join(PROJECT_ROOT, 'job-data');
 
 const {
@@ -27,6 +28,7 @@ const {
   buildPromptFromTemplate,
   callOllamaGenerateWithRetry,
   postProcessCoverLetterText,
+  looksLikeOutlineLetter,
   getJobId,
   generateCoverLetterBasename,
   writeCoverLetterToFolder,
@@ -126,7 +128,19 @@ async function main() {
   console.log('[cover letter] Checking Ollama...');
   const { startedByUs } = await ensureOllamaRunning({ spawnIfNeeded: true });
   const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
-  console.log('[cover letter] LLM backend:', startedByUs ? 'Ollama (started by this script)' : 'Ollama (already running)');
+  const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+  let backendLog = 'Ollama (already running)';
+  if (startedByUs) backendLog = 'Ollama (started by this script)';
+  else {
+    try {
+      const url = new URL(OLLAMA_BASE_URL);
+      const host = (url.hostname || '').toLowerCase();
+      if (host !== 'localhost' && host !== '127.0.0.1' && host !== '::1') {
+        backendLog = `Ollama (remote: ${OLLAMA_BASE_URL})`;
+      }
+    } catch (_) { /* keep default */ }
+  }
+  console.log('[cover letter] LLM backend:', backendLog);
   console.log('[cover letter] Model:', OLLAMA_MODEL);
 
   const applicantDetails = loadApplicantDetails();
@@ -154,9 +168,36 @@ async function main() {
         console.log('[cover letter] Building prompt...');
         const prompt = buildPromptFromTemplate(job, context);
         console.log(`[cover letter] Prompt ready (${prompt.length} chars). Calling Ollama (this may take 1-2 minutes)...`);
-        const responseText = await callOllamaGenerateWithRetry(prompt);
+        const OUTLINE_RETRY_ATTEMPTS = 3;
+        let responseText = await callOllamaGenerateWithRetry(prompt);
         console.log('[cover letter] Ollama response received. Post-processing text...');
-        const cleaned = postProcessCoverLetterText(responseText, { applicantName });
+        let cleaned = postProcessCoverLetterText(responseText, { applicantName });
+        if (!cleaned || !String(cleaned).trim()) {
+          throw new Error(
+            'Cover letter extraction failed: no content could be extracted from the model response. Try running again.'
+          );
+        }
+        let outlineRetries = 0;
+        while (looksLikeOutlineLetter(cleaned) && outlineRetries < OUTLINE_RETRY_ATTEMPTS) {
+          const previewLen = 600;
+          console.log(`[cover letter] [outline debug] Outline response (attempt ${outlineRetries + 1}):\n---\n${cleaned.slice(0, previewLen)}${cleaned.length > previewLen ? '...' : ''}\n---`);
+          outlineRetries++;
+          console.log(`[cover letter] Response is outline-style; retrying (${outlineRetries}/${OUTLINE_RETRY_ATTEMPTS}) for full letter...`);
+          responseText = await callOllamaGenerateWithRetry(prompt);
+          cleaned = postProcessCoverLetterText(responseText, { applicantName });
+          if (!cleaned || !String(cleaned).trim()) {
+            throw new Error(
+              'Cover letter extraction failed on retry. Try running again.'
+            );
+          }
+        }
+        if (looksLikeOutlineLetter(cleaned)) {
+          const previewLen = 600;
+          console.log(`[cover letter] [outline debug] Final response still outline after ${OUTLINE_RETRY_ATTEMPTS} retries:\n---\n${cleaned.slice(0, previewLen)}${cleaned.length > previewLen ? '...' : ''}\n---`);
+          throw new Error(
+            `Model returned an outline instead of a full letter after ${OUTLINE_RETRY_ATTEMPTS} retries. Please run the command again.`
+          );
+        }
         const folderName = getJobId(job, entry.path);
         const jobFolderPath = path.join(resolvedOutputDir, folderName);
         const fileBasename = generateCoverLetterBasename(job, {

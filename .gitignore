@@ -1,5 +1,8 @@
 node_modules/
 
+# Debug logs (cover letter pipeline)
+.cursor/debug-coverletter.log
+
 # Env and credentials (root or in config/) — never commit
 .env
 config/
